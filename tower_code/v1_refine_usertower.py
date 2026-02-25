@@ -1,3 +1,5 @@
+import datetime
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -58,6 +60,10 @@ class FeatureProcessor:
     
         
         
+        
+        
+        
+        
         if base_processor is None:
             # Train일 때: 새롭게 아이템 번호표 생성
             self.item_ids = self.items.index.tolist()
@@ -87,7 +93,9 @@ class FeatureProcessor:
         self.u_cat_arr = np.zeros((num_users_total, 5), dtype=np.int64)
         # Continuous (FloatTensor용)
         self.u_cont_arr = np.zeros((num_users_total, 4), dtype=np.float32)
-
+        
+        self.u_last_date_arr = np.zeros(num_users_total, dtype=np.int64)
+        
         # 매핑 수행
         for uid, row in self.users.iterrows():
             if uid not in self.user2id: continue
@@ -108,7 +116,9 @@ class FeatureProcessor:
                 row['price_std_scaled'], row['last_price_diff_scaled'],
                 row['repurchase_ratio_scaled'], row['weekend_ratio_scaled']
             ]
-
+            if pd.notnull(row['last_purchase_date']):
+                dt_val = pd.to_datetime(row['last_purchase_date'])
+                self.u_last_date_arr[uidx] = dt_val.toordinal()
         # [B] Item Side Info Lookup (아이템 ID 1~N으로 바로 접근)
         # 아이템 데이터 프레임에 type_id, color_id 등이 있다고 가정
         self.i_side_arr = np.zeros((self.num_items + 1, 4), dtype=np.int64)
@@ -192,11 +202,15 @@ class FeatureProcessor:
             print("✅ Success: All items in sequences are correctly mapped.")
         
 class SASRecDataset(Dataset):
-    def __init__(self, processor: FeatureProcessor, max_len=30, is_train=True):
+    def __init__(self, processor: FeatureProcessor, global_now_str ="2020-09-22", max_len=30, is_train=True):
         self.processor = processor
         self.max_len = max_len
         self.is_train = is_train
         self.user_ids = processor.user_ids
+        
+        global_now_dt = pd.to_datetime(global_now_str)
+        self.now_ordinal = global_now_dt.toordinal()
+        self.now_week = global_now_dt.isocalendar().week
 
     def __len__(self):
         return len(self.user_ids)
@@ -270,6 +284,23 @@ class SASRecDataset(Dataset):
         u_cats = self.processor.u_cat_arr[u_mapped_id]
         u_conts = self.processor.u_cont_arr[u_mapped_id]
 
+        # ====================
+        # global time 
+        # =====================
+        last_ordinal = self.processor.u_last_date_arr[u_mapped_id]
+    
+        if last_ordinal == 0: # 패딩이거나 구매 이력이 아예 없는 경우
+            recency_offset = 365
+            current_week = self.now_week # 예비용 기본값
+        else:
+            # 1. Recency Offset (기존 유지: 오늘로부터 얼마나 낡았는가?)
+            recency_offset = self.now_ordinal - last_ordinal
+            recency_offset = max(0, min(365, recency_offset))
+            
+            # 🔥 2. Current Week (핵심 수정: 유저의 마지막 구매 시점의 주차!)
+            last_date = datetime.date.fromordinal(last_ordinal)
+            current_week = last_date.isocalendar().week
+        
         # =========================================================
         # 6. Return Tensors
         # =========================================================
@@ -302,7 +333,11 @@ class SASRecDataset(Dataset):
             'active_ids': torch.tensor(u_cats[4], dtype=torch.long),
             
             # User Continuous
-            'cont_feats': torch.tensor(u_conts, dtype=torch.float32)
+            'cont_feats': torch.tensor(u_conts, dtype=torch.float32),
+            
+            # 💡 [추가] Global Context (모델의 Early Injection 입력용)
+            'recency_offset': torch.tensor(recency_offset, dtype=torch.long),
+            'current_week': torch.tensor(current_week, dtype=torch.long)
         }
     
 import torch
@@ -859,3 +894,318 @@ def inbatch_corrected_logq_loss(
     # 5. 최종 CrossEntropyLoss 계산
     labels = torch.arange(N, device=user_emb.device)
     return F.cross_entropy(logits, labels)
+
+
+
+
+
+'''
+
+import torch
+import torch.nn.functional as F
+
+def inbatch_corrected_logq_loss_with_hard_neg(
+    user_emb, item_tower_emb, target_ids, user_ids, log_q_tensor,
+    batch_hard_neg_ids=None, # [N, 2] 크기의 텐서
+    temperature=0.1, 
+    lambda_logq=1.0,         # In-batch용 강한 보정
+    hard_lambda_logq=0.0     # Hard Negative용 보정
+):
+    N = user_emb.size(0)
+    
+    # -------------------------------------------------------
+    # 1. In-Batch Logits & LogQ 보정
+    # -------------------------------------------------------
+    batch_item_emb = item_tower_emb[target_ids]
+    logits = torch.matmul(user_emb, batch_item_emb.T) / temperature
+
+    if lambda_logq > 0.0:
+        batch_log_q = log_q_tensor[target_ids]
+        logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
+
+    # In-Batch 마스킹 로직 (Same Item, Same User)
+    same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
+    same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
+    diag_mask = torch.eye(N, dtype=torch.bool, device=user_emb.device)
+    
+    false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
+    logits.masked_fill_(false_neg_mask, float('-inf'))
+
+    # -------------------------------------------------------
+    # 2. Hard Negative Injection & 패딩 마스킹 (💡 핵심)
+    # -------------------------------------------------------
+    if batch_hard_neg_ids is not None:
+        # batch_hard_neg_ids shape: [N, num_hard_negs]
+        hard_neg_emb = item_tower_emb[batch_hard_neg_ids] # [N, num_hard_negs, dim]
+        
+        # [N, 1, dim] x [N, dim, num_hard_negs] -> [N, 1, num_hard_negs] -> [N, num_hard_negs]
+        hn_logits = torch.bmm(user_emb.unsqueeze(1), hard_neg_emb.transpose(1, 2)).squeeze(1)
+        hn_logits.div_(temperature)
+        
+        if hard_lambda_logq > 0.0:
+            hn_log_q = log_q_tensor[batch_hard_neg_ids]
+            hn_logits = hn_logits - (hn_log_q * hard_lambda_logq)
+            
+        # 💡 [방어 로직] 뽑힌 Hard Negative가 0번(패딩/유효하지 않음)인 경우 -inf 처리
+        invalid_hn_mask = (batch_hard_neg_ids == 0)
+        hn_logits.masked_fill_(invalid_hn_mask, float('-inf'))
+            
+        # 기존 In-Batch Logits의 우측에 Hard Negative Logits를 결합
+        # 최종 logits shape: [N, N + num_hard_negs]
+        logits = torch.cat([logits, hn_logits], dim=1)
+        
+    # -------------------------------------------------------
+    # 3. CrossEntropy Loss
+    # -------------------------------------------------------
+    # 정답 라벨은 여전히 In-batch의 대각선(0부터 N-1)에 위치함
+    labels = torch.arange(N, device=user_emb.device)
+    return F.cross_entropy(logits, labels)
+'''
+def inbatch_corrected_logq_loss_with_hard_neg(
+    user_emb, item_tower_emb, target_ids, user_ids, log_q_tensor,
+    batch_hard_neg_ids=None, 
+    temperature=0.1, 
+    lambda_logq=1.0,         
+    hard_lambda_logq=1.0,    # 💡 Force Ratio 정상화를 위해 1.0 권장
+    alpha=0.7,               # 💡 사용자가 요청한 알파 가중치 유지
+    return_metrics=False     
+):
+    N = user_emb.size(0)
+    
+    # 1. In-Batch Logits
+    batch_item_emb = item_tower_emb[target_ids] 
+    sim_matrix = torch.matmul(user_emb, batch_item_emb.T) 
+    logits = sim_matrix / temperature
+
+    if lambda_logq > 0.0:
+        batch_log_q = log_q_tensor[target_ids]
+        logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
+
+    # 마스킹 (Same Item, Same User 제외)
+    same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
+    same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
+    diag_mask = torch.eye(N, dtype=torch.bool, device=user_emb.device)
+    false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
+    logits.masked_fill_(false_neg_mask, float('-inf'))
+
+    metrics = {}
+    
+    # 2. Hard Negative Injection
+    if batch_hard_neg_ids is not None:
+        # 전체 행렬에서 직접 인덱싱 (속도 중시 롤백)
+        hard_neg_emb = item_tower_emb[batch_hard_neg_ids] 
+        
+        hn_sim_matrix = torch.bmm(user_emb.unsqueeze(1), hard_neg_emb.transpose(1, 2)).squeeze(1)
+        
+        # 💡 Alpha와 Temperature를 이용해 로짓 계산
+        hn_logits = (hn_sim_matrix / temperature) * alpha
+        
+        # 💡 하드 네거티브에도 인기도 보정을 넣어줘야 Force Ratio가 살아납니다.
+        if hard_lambda_logq > 0.0:
+            hn_log_q = log_q_tensor[batch_hard_neg_ids]
+            hn_logits = hn_logits - (hn_log_q * hard_lambda_logq)
+            
+        invalid_hn_mask = (batch_hard_neg_ids == 0)
+        hn_logits.masked_fill_(invalid_hn_mask, float('-inf'))
+        
+        # 지표 계산
+        if return_metrics:
+            with torch.no_grad():
+                combined_logits = torch.cat([logits, hn_logits], dim=1)
+                probs = torch.softmax(combined_logits, dim=1)
+                
+                # 유저당 평균 에너지 측정
+                inbatch_force = probs[:, :N][~diag_mask & ~false_neg_mask].sum().item() / N
+                hn_force = probs[:, N:][~invalid_hn_mask].sum().item() / N
+                
+                metrics.update({
+                    'sim/pos': torch.diag(sim_matrix).mean().item(),
+                    'sim/hard_neg': hn_sim_matrix[~invalid_hn_mask].mean().item(),
+                    'sim/inbatch_neg': sim_matrix[~diag_mask & ~false_neg_mask].mean().item(),
+                    'force/ratio': hn_force / (inbatch_force + hn_force + 1e-8),
+                    'hn_active_ratio': (~invalid_hn_mask).float().mean().item()
+                })
+            
+        logits = torch.cat([logits, hn_logits], dim=1)
+
+    loss = F.cross_entropy(logits, torch.arange(N, device=user_emb.device))
+    return (loss, metrics) if return_metrics else loss
+
+
+def inbatch_corrected_logq_loss_with_shared_hard_neg(
+    user_emb, item_tower_emb, target_ids, user_ids, log_q_tensor,
+    shared_hn_ids=None,      # [128]
+    shared_hn_emb=None,      # [128, dim]
+    temperature=0.1, 
+    lambda_logq=1.0,         
+    alpha=1.5,               
+    return_metrics=False     
+):
+    N = user_emb.size(0)
+    
+    # 1. In-Batch Logits (N x N)
+    batch_item_emb = item_tower_emb[target_ids] 
+    sim_matrix = torch.matmul(user_emb, batch_item_emb.T) # [N, N]
+    logits = sim_matrix / temperature
+
+    if lambda_logq > 0.0:
+        batch_log_q = log_q_tensor[target_ids]
+        logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
+
+    # 마스킹 (자기 자신 및 동일 유저/아이템 제외)
+    diag_mask = torch.eye(N, dtype=torch.bool, device=user_emb.device)
+    same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
+    same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
+    false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
+    logits.masked_fill_(false_neg_mask, float('-inf'))
+
+    metrics = {}
+    
+    # 2. Shared Hard Negative Logits (N x 128)
+    if shared_hn_emb is not None:
+        hn_logits = torch.matmul(user_emb, shared_hn_emb.T) # [N, 128]
+        hn_logits = (hn_logits / temperature) * alpha
+        
+        if lambda_logq > 0.0:
+            hn_log_q = log_q_tensor[shared_hn_ids]
+            hn_logits = hn_logits - (hn_log_q.view(1, -1) * lambda_logq)
+            
+        if return_metrics:
+            with torch.no_grad():
+                combined_logits = torch.cat([logits, hn_logits], dim=1)
+                probs = torch.softmax(combined_logits, dim=1)
+                
+                # 정답 확률 및 오답 에너지(Force) 계산
+                pos_prob = torch.diag(probs[:, :N]).mean().item()
+                inbatch_prob_sum = probs[:, :N][~diag_mask & ~false_neg_mask].sum() / N
+                hn_prob_sum = probs[:, N:].sum() / N
+                
+                metrics.update({
+                    'sim/pos': torch.diag(sim_matrix).mean().item(),
+                    'sim/inbatch_neg': sim_matrix[~diag_mask & ~false_neg_mask].mean().item(),
+                    'sim/hard_neg': (torch.matmul(user_emb, shared_hn_emb.T)).mean().item(),
+                    'hn_active_ratio': 1.0,  # 배치 공유 방식에선 항상 모든 유저가 혜택을 보므로 1.0
+                    'force/ratio': (hn_prob_sum / (inbatch_prob_sum + hn_prob_sum + 1e-8)).item(),
+                    'prob/pos': pos_prob  # 모델이 정답을 얼마나 확신하는지 보는 유용한 지표
+                })
+            
+        logits = torch.cat([logits, hn_logits], dim=1)
+
+    # 3. Final Cross Entropy (정답 인덱스는 대각선인 0~N-1)
+    labels = torch.arange(N, device=user_emb.device)
+    loss = F.cross_entropy(logits, labels)
+    
+    return (loss, metrics) if return_metrics else loss
+
+
+import torch
+import torch.nn.functional as F
+def inbatch_corrected_logq_loss_with_hard_neg_margin(
+    user_emb, item_tower_emb, target_ids, user_ids, log_q_tensor,
+    last_hard_neg_ids=None,  # [B, num_hn]
+    flat_is_last=None,       # [N]
+    temperature=0.1, 
+    lambda_logq=1.0,         
+    alpha=1,               
+    margin=0.05,             # 💡 핵심: Positive Margin (정답을 더 꽉 잡게 만듦)
+    return_metrics=False     
+):
+    N = user_emb.size(0)
+    device = user_emb.device
+    
+    # -----------------------------------------------------------
+    # 1. In-batch Logits & Positive Margin 적용
+    # -----------------------------------------------------------
+    batch_item_emb = item_tower_emb[target_ids] 
+    sim_matrix = torch.matmul(user_emb, batch_item_emb.T) 
+    
+    # 💡 [핵심] Positive Margin: 정답(대각선)의 코사인 유사도를 강제로 깎아서 모델을 더 노력하게 만듦
+    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
+    sim_matrix[diag_mask] = sim_matrix[diag_mask] - margin
+    
+    logits = sim_matrix / temperature
+
+    # 인기도 보정 (LogQ)
+    if lambda_logq > 0.0:
+        batch_log_q = log_q_tensor[target_ids]
+        logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
+
+    # 마스킹 (동일 아이템, 동일 유저 제외 - 정답 대각선은 살림)
+    same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
+    same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
+    false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
+    logits.masked_fill_(false_neg_mask, float('-inf'))
+
+    metrics = {}
+    
+    # -----------------------------------------------------------
+    # 2. Hard Negative Logits (마지막 스텝 B개만 연산)
+    # -----------------------------------------------------------
+    if last_hard_neg_ids is not None and flat_is_last is not None:
+        B = last_hard_neg_ids.size(0)
+        num_hn = last_hard_neg_ids.size(1)
+        
+        # [B, num_hn, dim]
+        hard_neg_emb = item_tower_emb[last_hard_neg_ids] 
+        
+        # 전체 N개의 유저 임베딩 중 마지막 스텝(B개)만 추출: [B, dim]
+        last_user_emb = user_emb[flat_is_last]
+        
+        # [B, 1, dim] x [B, dim, num_hn] -> [B, num_hn]
+        hn_sim = torch.bmm(last_user_emb.unsqueeze(1), hard_neg_emb.transpose(1, 2)).squeeze(1)
+        
+        # 💡 오답에는 마진을 더하지 않음! 순수 코사인 유사도만 사용
+        hn_logits = (hn_sim / temperature) * alpha
+        
+        if lambda_logq > 0.0:
+            hn_log_q = log_q_tensor[last_hard_neg_ids]
+            hn_logits = hn_logits - (hn_log_q * lambda_logq)
+            
+        invalid_hn_mask = (last_hard_neg_ids == 0)
+        hn_logits.masked_fill_(invalid_hn_mask, float('-inf'))
+        
+        # 전체 행렬 N 크기에 맞게 채워 넣기 (마지막 스텝이 아닌 로우는 -inf)
+        all_hn_logits = torch.full((N, num_hn), float('-inf'), device=device)
+        all_hn_logits[flat_is_last] = hn_logits
+        
+        # 최종 로짓 병합 [N, N + num_hn]
+        logits = torch.cat([logits, all_hn_logits], dim=1)
+        # Metrics 계산 (선택 사항)
+        if return_metrics:
+            with torch.no_grad():
+                probs = torch.softmax(logits, dim=1)
+                
+                # 1. 모델 붕괴 확인용: 정답을 맞출 확률
+                pos_prob = torch.diag(probs[:, :N]).mean().item()
+                
+                # 💡 2. [핵심] 하드 네거티브의 상대적 Gradient Power 계산
+                # 하드 네거티브가 개입된 '마지막 스텝(B개)' 행만 추출
+                probs_last = probs[flat_is_last] # [B, N + num_hn]
+                
+                # In-batch Negative들의 확률 합 (정답 및 False Negative 제외)
+                # diag_mask와 false_neg_mask도 마지막 스텝 B개에 해당하는 행만 가져옵니다.
+                valid_inbatch_mask = ~(diag_mask[flat_is_last] | false_neg_mask[flat_is_last])
+                inbatch_prob_sum = probs_last[:, :N][valid_inbatch_mask].sum().item() / B
+                
+                # Hard Negative들의 확률 합
+                hn_prob_sum = probs_last[:, N:].sum().item() / B
+                
+                metrics.update({
+                    'sim/pos': (torch.diag(sim_matrix) + margin).mean().item(), # 마진 복구해서 로깅
+                    'sim/hard_neg': hn_sim[~invalid_hn_mask].mean().item(),
+                    'prob/pos': pos_prob,
+                    
+                    # 💡 하드 네거티브가 오답들 사이에서 행사하는 지분 (0.0 ~ 1.0)
+                    'force/hn_power_ratio': hn_prob_sum / (inbatch_prob_sum + hn_prob_sum + 1e-8),
+                    
+                    # 유효하게 0번 패딩이 아닌 하드 네거티브의 비율
+                    'hn_active_ratio': (~invalid_hn_mask).float().mean().item()
+                })
+
+    # -----------------------------------------------------------
+    # 3. Final Loss
+    # -----------------------------------------------------------
+    labels = torch.arange(N, device=device)
+    loss = F.cross_entropy(logits, labels)
+    
+    return (loss, metrics) if return_metrics else loss

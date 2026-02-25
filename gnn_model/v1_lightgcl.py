@@ -9,6 +9,7 @@ import os
 import json
 from tqdm import tqdm
 
+
 # ==========================================
 # 1. 데이터 로드 및 전처리
 # ==========================================
@@ -560,6 +561,18 @@ def train_fine_tuning(new_config, checkpoint_path):
 
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} Done. Avg Loss: {avg_loss:.4f}")
+        
+        
+def item_occur_main(new_config):
+    edge_index, num_users, num_items, _, _ = load_and_process_data(
+        new_config['json_file_path'], new_config['cache_dir']
+    )
+    #adj_tensor, U, S, V = build_graph(
+    #    edge_index, num_users, num_items, new_config['device'], q=new_config['svd_q']
+    #)
+    #analyze_item_cooccurrence(edge_index, num_users, num_items)
+    
+    
 # ==========================================
 # 6. Main Execution
 # ==========================================
@@ -616,7 +629,8 @@ if __name__ == '__main__':
     }
 
     checkpoint_path = os.path.join(FINE_TUNE_CONFIG['cache_dir'], "lightgcl_last_checkpoint.pth")   
-    train_fine_tuning(FINE_TUNE_CONFIG, checkpoint_path)
+    #train_fine_tuning(FINE_TUNE_CONFIG, checkpoint_path)
+    item_occur_main(NEW_CONFIG)
     '''
     # 1. 메인에서 데이터 로드 (한 번만 수행)
     edge_index, num_users, num_items, _, _ = load_and_process_data(

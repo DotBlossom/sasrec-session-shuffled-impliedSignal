@@ -9,6 +9,14 @@ from pandarallel import pandarallel
 from sklearn.preprocessing import StandardScaler
 
 import torch
+import sys
+
+
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if root_path not in sys.path:
+    sys.path.append(root_path)
+
+from preprocessor.preprocessor_v2 import make_user_features_v3
 
 # ==========================================
 # 0. Global Settings
@@ -280,19 +288,19 @@ def make_user_features(train_df, target_val_path):
     print("\n👤 [User Stats] Calculating Enhanced Features (with Bucketing & Scaling)...")
 
 
+    if target_val_path != None:
 
+        print("\n🎯 [Validation User Stats] Preparing point-in-time features...")
 
-    print("\n🎯 [Validation User Stats] Preparing point-in-time features...")
+        # 1. 평가 대상 유저 ID 추출 (정답지가 있는 유저들)
+        target_val = pd.read_parquet(target_val_path)
+        val_user_set = set(target_val['customer_id'].unique())
+        print(f" -> Found {len(val_user_set):,} target users for validation.")
 
-    # 1. 평가 대상 유저 ID 추출 (정답지가 있는 유저들)
-    target_val = pd.read_parquet(target_val_path)
-    val_user_set = set(target_val['customer_id'].unique())
-    print(f" -> Found {len(val_user_set):,} target users for validation.")
-
-    # 2. 9/15 이전 거래 중 '평가 대상 유저'의 기록만 추출
-    # (이미 full_df가 9/15 이전 데이터라면 날짜 필터는 생략 가능)
-    val_train_df = train_df[train_df['customer_id'].isin(val_user_set)].copy()
-    print(f" -> Using {len(val_train_df):,} transaction records for feature calculation.")
+        # 2. 9/15 이전 거래 중 '평가 대상 유저'의 기록만 추출
+        # (이미 full_df가 9/15 이전 데이터라면 날짜 필터는 생략 가능)
+        val_train_df = train_df[train_df['customer_id'].isin(val_user_set)].copy()
+        print(f" -> Using {len(val_train_df):,} transaction records for feature calculation.")
 
 
 
@@ -304,14 +312,14 @@ def make_user_features(train_df, target_val_path):
     train_df['month_id'] = train_df['t_dat'].dt.to_period('M')
 
     user_agg = train_df.groupby('customer_id').agg({
-        'price': ['mean', 'std', 'last'],  
+        'price': ['mean', 'std', 'last'],  # last가 .. 세션 last 평균이여야 좋을텐데
         'article_id': ['count', 'nunique'], 
         't_dat': 'max',                     
         'sales_channel_id': 'mean',         
         'is_weekend': 'mean',               
         'month_id': 'nunique'               
     })
-    
+    #이름붙이기
     user_agg.columns = [
         'user_avg_price', 'price_std', 'last_price',
         'total_cnt', 'unique_item_cnt',
@@ -385,12 +393,14 @@ def make_user_features(train_df, target_val_path):
     for col in ['FN', 'Active', 'club_member_status_idx', 'fashion_news_frequency_idx']:
         final_df[col] = final_df[col].fillna(0).astype(np.int8)
 
+    final_df['last_purchase_date'] = final_df['last_purchase_date'].dt.strftime('%Y-%m-%d')
+    
     # ==========================================
     # 4. Final Selection & Save
     # ==========================================
     # 저장할 최종 컬럼 (Bucket IDs 4개, Scaled Cont 4개, Categorical IDs 5개)
     final_cols = [
-        'customer_id', 
+        'customer_id', 'last_purchase_date',
         'user_avg_price_bucket', 'total_cnt_bucket', 'recency_bucket', 'age_bucket', # Bucket IDs
         'price_std_scaled', 'last_price_diff_scaled', 'repurchase_ratio_scaled', 'weekend_ratio_scaled', # Scaled Cont
         'preferred_channel', 'active_months', 'FN', 'Active', 'club_member_status_idx', 'fashion_news_frequency_idx' # Categoricals
@@ -857,7 +867,14 @@ if __name__ == "__main__":
     
     TARGET_VAL_PATH = os.path.join(BASE_DIR, "features_target_val.parquet")
     
-    make_user_features(train_only_df,TARGET_VAL_PATH)
+    
+    
+    
+    
+    USER_FEAT_PATH_v2_PQ = os.path.join(BASE_DIR, "features_user_w_meta_nonleak.parquet")
+    USER_FEAT_VAL_PATH_v2_PQ = os.path.join(BASE_DIR, "features_user_w_meta_nonleak_val.parquet")
+    
+    make_user_features_v3(train_only_df,TARGET_VAL_PATH, USER_META_PATH, USER_FEAT_VAL_PATH_v2_PQ)
     
     
     # 2. Validation용 정답지 먼저 생성 (이건 full_df가 필요함)

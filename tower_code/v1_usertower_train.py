@@ -10,9 +10,18 @@ from dataclasses import dataclass
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import pickle
+import sys
 
+from sheduler import EarlyStopping, get_cosine_schedule_with_warmup
+
+
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if root_path not in sys.path:
+    sys.path.append(root_path)
 import wandb
-from v1_refine_usertower import FeatureProcessor, SASRecDataset, SASRecUserTower, dataset_peek, duorec_loss_refined, full_batch_hard_emphasis_loss, inbatch_corrected_logq_loss, inbatch_hnm_corrected_loss_with_stats,inbatch_mixed_hnm_loss_with_stats
+from preprocessor.preprocessor_v2 import FeatureProcessor_v3, dataset_peek_v3
+from v2_usetower_model import SASRecDataset_v2, SASRecDataset_v3, SASRecUserTower_v2, SASRecUserTower_v3
+from v1_refine_usertower import FeatureProcessor, SASRecDataset, SASRecUserTower, dataset_peek, duorec_loss_refined, full_batch_hard_emphasis_loss, inbatch_corrected_logq_loss, inbatch_corrected_logq_loss_with_hard_neg, inbatch_corrected_logq_loss_with_hard_neg_margin, inbatch_corrected_logq_loss_with_shared_hard_neg, inbatch_hnm_corrected_loss_with_stats,inbatch_mixed_hnm_loss_with_stats
 
 
 # =====================================================================
@@ -23,7 +32,8 @@ class PipelineConfig:
     # Paths
     base_dir: str = r"D:\trainDataset\localprops"
     model_dir: str = r"C:\Users\candyform\Desktop\inferenceCode\models"
-    
+    ft_model_dir: str = r"C:\Users\candyform\Desktop\inferenceCode\models\finetune"
+
     # Hyperparameters
     batch_size: int = 768
     lr: float = 5e-4
@@ -33,7 +43,7 @@ class PipelineConfig:
     # Model Args (SASRecUserTower용)
     d_model: int = 128
     max_len: int = 50
-    dropout: float = 0.2
+    dropout: float = 0.3
     pretrained_dim: int = 128 # 사전학습 아이템 벡터 차원 
     nhead: int = 4
     num_layers: int = 2
@@ -59,6 +69,7 @@ class PipelineConfig:
     num_sections: int = 0
     num_age_groups: int = 10
 
+    max_target_len: int = 10
 # =====================================================================
 # Phase 1: Environment Setup
 # =====================================================================
@@ -74,6 +85,9 @@ def setup_environment(seed: int = 42):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"✅ Device set to: {device}")
     return device
+
+
+
 
 # =====================================================================
 # Phase 2: Data Preparation
@@ -97,17 +111,17 @@ def prepare_features(cfg: PipelineConfig):
         print("   ⚠️ [Cache Miss] Cache not found. Processing from Parquet files...")
         
         # 경로 설정
-        user_path = os.path.join(cfg.base_dir, "features_user_w_meta.parquet") 
+        user_path = os.path.join(cfg.base_dir, "features_user_w_meta_nonleak.parquet") 
         item_path = os.path.join(cfg.base_dir, "features_item.parquet")
-        seq_path = os.path.join(cfg.base_dir, "features_sequence_cleaned.parquet")
+        #seq_path = os.path.join(cfg.base_dir, "features_sequence_cleaned.parquet")
         
         TARGET_VAL_PATH = os.path.join(cfg.base_dir, "features_target_val.parquet")
-        USER_VAL_FEAT_PATH = os.path.join(cfg.base_dir, "features_user_w_meta_val.parquet")
-        SEQ_VAL_DATA_PATH = os.path.join(cfg.base_dir, "features_sequence_val.parquet")
+        USER_VAL_FEAT_PATH = os.path.join(cfg.base_dir, "features_user_w_meta_nonleak_val.parquet")
+        #SEQ_VAL_DATA_PATH = os.path.join(cfg.base_dir, "features_sequence_val.parquet")
         
         # Processor 초기화 
-        train_proc = FeatureProcessor(user_path, item_path, seq_path)
-        val_proc = FeatureProcessor(USER_VAL_FEAT_PATH, item_path, SEQ_VAL_DATA_PATH, base_processor=train_proc)
+        train_proc = FeatureProcessor_v3(user_path, item_path)
+        val_proc = FeatureProcessor_v3(USER_VAL_FEAT_PATH, item_path, base_processor=train_proc)
         
         # [신규] 생성된 Processor 객체를 로컬 파일로 저장 (HIGHEST_PROTOCOL로 속도/용량 최적화)
         print("   💾 Saving processors to local cache for future use...")
@@ -118,12 +132,14 @@ def prepare_features(cfg: PipelineConfig):
     cfg.num_items = train_proc.num_items
     
     ####### 실제 item metadata id랑 묶인상태로 가져와야하고 연결 필요 #######
-    cfg.num_prod_types = int(train_proc.items['type_id'].max()) if 'type_id' in train_proc.items else 50
-    cfg.num_colors = int(train_proc.items['color_id'].max()) if 'color_id' in train_proc.items else 50
-    cfg.num_graphics = int(train_proc.items['graphic_id'].max()) if 'graphic_id' in train_proc.items else 50
-    cfg.num_sections = int(train_proc.items['section_id'].max()) if 'section_id' in train_proc.items else 50
-
+    cfg.num_prod_types = int(train_proc.i_side_arr[:, 0].max()) + 1
+    cfg.num_colors = int(train_proc.i_side_arr[:, 1].max()) + 1
+    cfg.num_graphics = int(train_proc.i_side_arr[:, 2].max()) + 1
+    cfg.num_sections = int(train_proc.i_side_arr[:, 3].max()) + 1
+    
+    print(f"✅ Max hash needed: {cfg.num_prod_types+cfg.num_colors + cfg.num_graphics +  cfg.num_sections}")
     print(f"✅ Features Loaded. Total Items: {cfg.num_items}")
+    
     return train_proc, val_proc, cfg
 # =====================================================================
 # Phase 3: Embedding Alignment & DataLoader
@@ -159,13 +175,13 @@ def load_aligned_pretrained_embeddings(processor, model_dir, pretrained_dim):
         
     return aligned_weight
 
-def create_dataloaders(processor, cfg: PipelineConfig, aligned_pretrained_vecs=None, is_train=True):
+def create_dataloaders(processor, cfg: PipelineConfig, global_now_str, aligned_pretrained_vecs=None, is_train=True):
     """Dataset 및 DataLoader 인스턴스화"""
     mode_str = "Train" if is_train else "Validation"
     print(f"\n📦 [Phase 3-2] Creating {mode_str} DataLoaders...")
     
     # 💡 1. is_train 파라미터 전달
-    dataset = SASRecDataset(processor, max_len=cfg.max_len, is_train=is_train)
+    dataset = SASRecDataset_v3(processor, global_now_str = global_now_str, max_len=cfg.max_len, is_train=is_train)
     
     # Dataset 인스턴스에 정렬된 pretrained vector 룩업 테이블 주입
     dataset.pretrained_lookup = aligned_pretrained_vecs 
@@ -259,6 +275,11 @@ def load_item_metadata_hashed(processor, base_dir, hash_size=1000):
 
     print(f"✅ Metadata Matched & Hashed: {matched}/{len(processor.item_ids)} (Hash Size: {hash_size})")
     
+    del item_data
+    del metadata_dict
+    import gc
+    gc.collect()
+    
     return torch.tensor(item_side_arr, dtype=torch.long)
 # =====================================================================
 # Phase 4: Model Setup
@@ -284,7 +305,14 @@ class SASRecItemTower(nn.Module):
     def set_freeze_state(self, freeze: bool):
         for param in self.parameters():
             param.requires_grad = not freeze
-            
+        # SASRecItemTower 클래스 내부에 추가
+    def get_embeddings(self, item_ids):
+        """
+        특정 아이템 ID들에 대해서만 임베딩을 추출 (VRAM 절약용)
+        item_ids: [num_unique_ids] 형태의 텐서
+        """
+        # item_matrix 레이어를 직접 호출하여 인덱싱된 임베딩을 가져옵니다.
+        return self.item_matrix(item_ids)
     # 💡 [핵심] 밖에서 억지로 쑤셔넣지 않고, 클래스 스스로 추론 벡터를 받아 초기화하는 메서드
     def init_from_pretrained(self, pretrained_vecs):
         """추론된 사전학습 벡터를 미세조정 가능한 파라미터(Weight)로 초기화"""
@@ -296,7 +324,7 @@ def setup_models(cfg: PipelineConfig, device, item_state_dict=None, log_q_tensor
     print(f"\n🧠 [Phase 4] Initializing Models...")
     
     # 1. User Tower 생성
-    user_tower = SASRecUserTower(cfg).to(device)
+    user_tower = SASRecUserTower_v3(cfg).to(device)
     
     # 2. Item Tower 뼈대 생성
     item_tower = SASRecItemTower(
@@ -326,6 +354,8 @@ def setup_models(cfg: PipelineConfig, device, item_state_dict=None, log_q_tensor
     print(f"✅ Item Tower State: {mode_str}")
     
     return user_tower, item_tower
+
+
 
 # =====================================================================
 # Phase 5: Training Loop 
@@ -430,6 +460,9 @@ def train_user_tower(epoch, model, item_tower, log_q_tensor, dataloader, optimiz
         # 2. Forward & Real Loss Calculation (AMP)
         # -------------------------------------------------------
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+            
+            
+            
             # A. First View
             output_1 = model(**forward_kwargs)
             # B. Second View (Dropout 마스크가 달라짐)
@@ -480,6 +513,7 @@ def train_user_tower(epoch, model, item_tower, log_q_tensor, dataloader, optimiz
                 user_emb_1=last_output_1,
                 user_emb_2=last_output_2,
                 target_ids=last_targets,
+                temperature = 0.07,
                 lambda_sup=cfg.lambda_sup
             )
 
@@ -545,7 +579,7 @@ from tqdm import tqdm
 
 
 # 💡 인자에 processor를 추가했습니다.
-def evaluate_model(model, item_tower, dataloader, target_df_path, device, processor, k_list=[20, 100, 500]):
+def evaluate_model(model, item_tower, dataloader, target_df_path, device, processor, k_list=[10, 20, 200,500]):
     """
     Validation 데이터셋과 정답지(target_dict)를 이용해 Recall@K를 평가하는 함수
     """
@@ -554,7 +588,7 @@ def evaluate_model(model, item_tower, dataloader, target_df_path, device, proces
     print(f"🎯 Loading targets from: {target_df_path}")
     target_df = pd.read_parquet(target_df_path)
     target_dict = target_df.set_index('customer_id')['target_ids'].to_dict()
-    
+    del target_df
     # K값 중 가장 큰 값을 기준으로 한 번만 Top-K 연산을 수행하여 GPU 연산 절약
     max_k = max(k_list)
     
@@ -599,7 +633,9 @@ def evaluate_model(model, item_tower, dataloader, target_df_path, device, proces
             news_freq_ids = batch['news_freq_ids'].to(device)
             fn_ids = batch['fn_ids'].to(device)
             active_ids = batch['active_ids'].to(device)
-            cont_feats = batch['cont_feats'].to(device)
+            cont_feats = batch['cont_feats'].to(device)        
+            recency_offset = batch['recency_offset'].to(device)
+            current_week = batch['current_week'].to(device)
             
             # Pretrained Vector 룩업 처리
             if 'pretrained_vecs' in batch:
@@ -640,6 +676,7 @@ def evaluate_model(model, item_tower, dataloader, target_df_path, device, proces
                 'fn_ids': fn_ids,
                 'active_ids': active_ids,
                 'cont_feats': cont_feats,
+                'recency_offset': recency_offset, 'current_week': current_week,
                 'padding_mask': padding_mask,
                 'training_mode': False # Dropout 비활성화
             }
@@ -694,9 +731,34 @@ def evaluate_model(model, item_tower, dataloader, target_df_path, device, proces
                 
                 total_valid_users += 1
                 for k in k_list:
-                    # 예측한 Top-K 리스트(pred_ids) 중 단 하나라도 실제 구매 목록(actual_indices)에 포함되어 있다면 Hit
-                    if not actual_indices.isdisjoint(pred_ids[i, :k]):
-                        total_hits[k] += 1
+                    # 1. Top-K 예측 리스트를 Set으로 변환
+                    pred_set = set(pred_ids[i, :k])
+                    
+                    # 2. 교집합(맞춘 아이템들) 추출
+                    hit_items = actual_indices.intersection(pred_set)
+                    
+                    # 3. (맞춘 개수 / 실제 구매한 전체 개수) 비율 계산
+                    user_recall = len(hit_items) / len(actual_indices)
+                    
+                    # 4. 해당 비율을 누적
+                    total_hits[k] += user_recall
+            
+            
+            if 'scores' in locals():
+                del scores, topk_indices
+            
+            # 2. Forward 연산 결과 텐서 해제
+            del output, last_user_emb
+            if 'valid_user_emb' in locals():
+                del valid_user_emb
+                
+            # 3. 입력 피처 및 kwargs 일괄 해제
+            del item_ids, padding_mask, time_bucket_ids, pretrained_vecs
+            del type_ids, color_ids, graphic_ids, section_ids
+            del age_bucket, price_bucket, cnt_bucket, recency_bucket
+            del channel_ids, club_status_ids, news_freq_ids, fn_ids, active_ids, cont_feats
+            del recency_offset, current_week
+            del forward_kwargs
 
     # 최종 Recall 퍼센티지 계산
     results = {}
@@ -708,172 +770,234 @@ def evaluate_model(model, item_tower, dataloader, target_df_path, device, proces
     for k in k_list:
         print(f"   - Recall@{k:03d}: {results.get(f'Recall@{k}', 0):.2f}%")
         
+    del full_item_embeddings, norm_item_embeddings
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     return results
 
 
 from tqdm import tqdm
 import wandb
-
-def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader, optimizer, scaler, cfg, device, seq_labels=None, static_labels=None):
-    """단일 에포크 훈련 함수 (All Time Steps + Same-User Masking 적용)"""
+from torch.nn.attention import SDPBackend, sdpa_kernel
+def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader, optimizer, scaler, cfg, device, hard_neg_pool_tensor, scheduler, seq_labels=None, static_labels=None):
+    """단일 에포크 훈련 함수 (All Time Steps + Same-User Masking 적용) + Gradient Accumulation"""
     model.train()
     total_loss_accum = 0.0
     main_loss_accum = 0.0
     cl_loss_accum = 0.0
     
-    # 안전을 위해 labels가 None일 경우 빈 리스트로 초기화
+    # 💡 [핵심 1] 누적 스텝 설정 (384 * 2 = 768)
+    accumulation_steps = 1
+    
     seq_labels = seq_labels or []
     static_labels = static_labels or []
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
+    
+    # 💡 [핵심 2] 루프 시작 전, 혹시 남아있을지 모르는 이전 에포크의 그래디언트 초기화
+    #optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
+    
     for batch_idx, batch in enumerate(pbar):
-        optimizer.zero_grad()
+        # ❌ optimizer.zero_grad() # 매 미니배치마다 초기화하면 안 되므로 삭제!
 
         # -------------------------------------------------------
-        # 1. Data Unpacking
+        # 1. Data Unpacking (기존과 동일)
         # -------------------------------------------------------
-        item_ids = batch['item_ids'].to(device)
-        target_ids = batch['target_ids'].to(device)
-        padding_mask = batch['padding_mask'].to(device)
-        time_bucket_ids = batch['time_bucket_ids'].to(device)
+        item_ids = batch['item_ids'].to(device, non_blocking=True)
+        target_ids = batch['target_ids'].to(device, non_blocking=True)
+        padding_mask = batch['padding_mask'].to(device, non_blocking=True)
+        time_bucket_ids = batch['time_bucket_ids'].to(device, non_blocking=True)
         
-        type_ids = batch['type_ids'].to(device)
-        color_ids = batch['color_ids'].to(device)
-        graphic_ids = batch['graphic_ids'].to(device)
-        section_ids = batch['section_ids'].to(device)
+        type_ids = batch['type_ids'].to(device, non_blocking=True)
+        color_ids = batch['color_ids'].to(device, non_blocking=True)
+        graphic_ids = batch['graphic_ids'].to(device, non_blocking=True)
+        section_ids = batch['section_ids'].to(device, non_blocking=True)
         
-        age_bucket = batch['age_bucket'].to(device)
-        price_bucket = batch['price_bucket'].to(device)
-        cnt_bucket = batch['cnt_bucket'].to(device)
-        recency_bucket = batch['recency_bucket'].to(device)
+        age_bucket = batch['age_bucket'].to(device, non_blocking=True)
+        price_bucket = batch['price_bucket'].to(device, non_blocking=True)
+        cnt_bucket = batch['cnt_bucket'].to(device, non_blocking=True)
+        recency_bucket = batch['recency_bucket'].to(device, non_blocking=True)
         
-        channel_ids = batch['channel_ids'].to(device)
-        club_status_ids = batch['club_status_ids'].to(device)
-        news_freq_ids = batch['news_freq_ids'].to(device)
-        fn_ids = batch['fn_ids'].to(device)
-        active_ids = batch['active_ids'].to(device)
-        cont_feats = batch['cont_feats'].to(device)
+        channel_ids = batch['channel_ids'].to(device, non_blocking=True)
+        club_status_ids = batch['club_status_ids'].to(device, non_blocking=True)
+        news_freq_ids = batch['news_freq_ids'].to(device, non_blocking=True)
+        fn_ids = batch['fn_ids'].to(device, non_blocking=True)
+        active_ids = batch['active_ids'].to(device, non_blocking=True)
+        cont_feats = batch['cont_feats'].to(device, non_blocking=True)
+        
+        recency_offset = batch['recency_offset'].to(device, non_blocking=True)
+        current_week = batch['current_week'].to(device, non_blocking=True)
         
         if 'pretrained_vecs' in batch:
-            pretrained_vecs = batch['pretrained_vecs'].to(device)
+            pretrained_vecs = batch['pretrained_vecs'].to(device, non_blocking=True)
         else:
-            pretrained_vecs = dataloader.dataset.pretrained_lookup[item_ids.cpu()].to(device)
+            pretrained_vecs = dataloader.dataset.pretrained_lookup[item_ids.cpu()].to(device, non_blocking=True)
             
         forward_kwargs = {
             'pretrained_vecs': pretrained_vecs,
             'item_ids': item_ids,
             'time_bucket_ids': time_bucket_ids,
-            'type_ids': type_ids,
-            'color_ids': color_ids,
-            'graphic_ids': graphic_ids,
-            'section_ids': section_ids,
-            'age_bucket': age_bucket,
-            'price_bucket': price_bucket,
-            'cnt_bucket': cnt_bucket,
-            'recency_bucket': recency_bucket,
-            'channel_ids': channel_ids,
-            'club_status_ids': club_status_ids,
-            'news_freq_ids': news_freq_ids,
-            'fn_ids': fn_ids,
-            'active_ids': active_ids,
-            'cont_feats': cont_feats,
+            'type_ids': type_ids, 'color_ids': color_ids,
+            'graphic_ids': graphic_ids, 'section_ids': section_ids,
+            'age_bucket': age_bucket, 'price_bucket': price_bucket,
+            'cnt_bucket': cnt_bucket, 'recency_bucket': recency_bucket,
+            'channel_ids': channel_ids, 'club_status_ids': club_status_ids,
+            'news_freq_ids': news_freq_ids, 'fn_ids': fn_ids,
+            'active_ids': active_ids, 'cont_feats': cont_feats,
+            'recency_offset': recency_offset, 'current_week': current_week,
             'padding_mask': padding_mask,
             'training_mode': True
         }
-
+        # =======================================================
+        # 🕵️‍♂️ [Data Peek] 첫 번째 에포크, 첫 번째 배치에서 데이터 캡처!
+        # =======================================================
+        if epoch == 1 and batch_idx == 0:
+            print("\n" + "="*70)
+            print("🕵️‍♂️ [Tensor Peek] First Batch, First User Verification")
+            print("="*70)
+            
+            u_idx = 0 # 배치의 첫 번째 유저
+            seq_len = item_ids.shape[1]
+            valid_len = (~padding_mask[u_idx]).sum().item()
+            
+            print(f"✅ User Index in Batch: {u_idx} | Valid Length: {valid_len} / {seq_len}")
+            
+            # 1. 1명의 유저 시퀀스 데이터 확인 (패딩 포함 전체 리스트 출력)
+            print("\n[1. Sequence Alignment Check (Left Padding Expected)]")
+            print(f"📦 item_ids      : {item_ids[u_idx].tolist()}")
+            print(f"🎯 target_ids    : {target_ids[u_idx].tolist()}")
+            print(f"⏳ time_buckets  : {time_bucket_ids[u_idx].tolist()}")
+            print(f"📆 recency_offset: {recency_offset[u_idx].tolist()}")
+            print(f"💰 price_bucket  : {price_bucket[u_idx].tolist()}")
+            
+            # 2. forward_kwargs 형태(Shape) 확인
+            print("\n[2. forward_kwargs Shape Check]")
+            for k, v in forward_kwargs.items():
+                if isinstance(v, torch.Tensor):
+                    # 텐서인 경우 차원(Shape) 출력
+                    print(f" - {k:<15}: {list(v.shape)}")
+                else:
+                    # 텐서가 아닌 경우 (예: training_mode) 값 출력
+                    print(f" - {k:<15}: {v}")
+            print("="*70 + "\n")
         # -------------------------------------------------------
         # 2. Forward & Loss Calculation (AMP)
         # -------------------------------------------------------
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+            '''
+            allowed_backends = [
+                SDPBackend.FLASH_ATTENTION, 
+                SDPBackend.EFFICIENT_ATTENTION
+            ]
+    
+            with sdpa_kernel(allowed_backends):
+            '''
             output_1 = model(**forward_kwargs)
-            output_2 = model(**forward_kwargs)
-
-            # =======================================================
-            # 💡 [핵심] (1) Main Loss (All Time Steps -> 1D Flattening)
-            # =======================================================
-            valid_mask = ~padding_mask # (Batch, Seq) True면 유효 데이터
+            # output_2 = model(**forward_kwargs) # (DuoRec 제거되었으므로 주석 처리 권장)
             
-            # 1. 2D 텐서를 유효한 타임스텝만 1D로 필터링 (N, Dim) 및 (N,)
+            valid_mask = ~padding_mask 
+            batch_size, seq_len = item_ids.shape
+            
+            seq_positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+            last_indices = torch.max(seq_positions.masked_fill(~valid_mask, -1), dim=1)[0]
+            last_indices = last_indices.clamp(min=0) 
+            
+            batch_range = torch.arange(batch_size, device=device)
+            is_last_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+            is_last_mask[batch_range, last_indices] = True
+            
             flat_output = output_1[valid_mask] 
             flat_targets = target_ids[valid_mask]
+            flat_is_last = is_last_mask[valid_mask] 
             
-            # 2. 유저 ID 매핑 트릭: 문자열 ID 대신 현재 배치의 행(Row) 인덱스를 고유 ID로 사용
-            # (Batch, 1) 사이즈의 인덱스를 Seq 길이만큼 늘린 뒤 똑같이 Flatten 합니다.
-            batch_size, seq_len = item_ids.shape
             batch_row_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, seq_len)
-            flat_user_ids = batch_row_indices[valid_mask] # (N,) -> Same-User Masking에 사용됨
+            flat_user_ids = batch_row_indices[valid_mask] 
             
             if flat_output.size(0) > 0:
                 flat_user_emb = F.normalize(flat_output, p=2, dim=1)
+                last_hard_neg_ids = None 
                 
-                # 실시간 아이템 벡터 추출
-                full_item_embeddings = item_tower.get_all_embeddings()
-                norm_item_embeddings = F.normalize(full_item_embeddings, p=2, dim=1)
+                all_item_emb = item_tower.get_all_embeddings()
+                norm_item_embeddings = F.normalize(all_item_emb, p=2, dim=1)
                 
-                # 베이스라인 Loss 호출 (Same-User Masking 적용)
-                main_loss = inbatch_corrected_logq_loss(
-                    user_emb=flat_user_emb,
-                    item_tower_emb=norm_item_embeddings,
-                    target_ids=flat_targets,
-                    user_ids=flat_user_ids,  # 배치 내 로컬 고유 ID 전달
-                    log_q_tensor=log_q_tensor,
-                    temperature=0.1,         # Baseline 온도
-                    lambda_logq=cfg.lambda_logq
+                main_loss, b_metrics = inbatch_corrected_logq_loss_with_hard_neg_margin(
+                    user_emb=flat_user_emb, item_tower_emb=norm_item_embeddings,
+                    target_ids=flat_targets, user_ids=flat_user_ids,
+                    log_q_tensor=log_q_tensor, last_hard_neg_ids=last_hard_neg_ids, 
+                    flat_is_last=flat_is_last, temperature=0.1, 
+                    lambda_logq=cfg.lambda_logq, margin=0.00, alpha=1, return_metrics=True 
                 )
             else:
                 main_loss = torch.tensor(0.0, device=device)
             
-            # =======================================================
-            # (2) DuoRec Loss (여전히 Last Time Step Only 적용)
-            # =======================================================
-            # DuoRec은 시퀀스의 '최종 의도' 안정화에 목적이 있으므로 마지막 스텝만 사용하는 것이 맞습니다.
-            last_indices = (valid_mask.sum(dim=1) - 1).clamp(min=0)
-            batch_range = torch.arange(batch_size, device=device)
-            
-            last_output_1 = output_1[batch_range, last_indices]
-            last_output_2 = output_2[batch_range, last_indices]
-            last_targets = target_ids[batch_range, last_indices]
-            
-            cl_loss = duorec_loss_refined(
-                user_emb_1=last_output_1,
-                user_emb_2=last_output_2,
-                target_ids=last_targets,
-                lambda_sup=cfg.lambda_sup
-            )
+            total_loss = main_loss 
 
-            # 최종 Loss 조합
-            total_loss = main_loss + (cfg.lambda_cl * cl_loss)
+            # 💡 [핵심 3] 그래디언트 누적을 위한 Loss 스케일링
+            # 두 번 누적할 것이므로, 1번 더해질 때마다 절반의 크기로 더해져야 
+            # 배치 768을 한 번에 처리한 것과 수학적으로 동일한 스케일이 됩니다.
+            scaled_loss = total_loss / accumulation_steps
 
         # -------------------------------------------------------
-        # 3. Backward & Optimizer Step
+        # 3. Backward (Loss 누적)
         # -------------------------------------------------------
-        scaler.scale(total_loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        scaler.step(optimizer)
-        scaler.update()
+        # 주의: scaled_loss로 backward를 수행해야 그래디언트 크기가 유지됩니다.
+        scaler.scale(scaled_loss).backward()
 
-        # 누적 및 로깅
+        # -------------------------------------------------------
+        # 4. Optimizer Step & Scheduler (누적 주기에 도달했을 때만)
+        # -------------------------------------------------------
+        # 마지막 남은 자투리 배치(len(dataloader)와 같을 때)도 잊지 않고 업데이트해야 함
+        if ((batch_idx + 1) % accumulation_steps == 0) or ((batch_idx + 1) == len(dataloader)):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # 여기서 그래디언트를 비워줍니다.
+            #optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+            # 스케줄러도 "유효 배치(Effective Batch)"가 끝났을 때만 스텝을 밟습니다.
+            if scheduler is not None:
+                scheduler.step()
+
+        # -------------------------------------------------------
+        # 5. Logging (주의: 모니터링은 무조건 Unscaled Loss로!)
+        # -------------------------------------------------------
+        # 누적용 변수나 화면에 보여줄 때는 쪼개지 않은 원래 total_loss를 써야 착시가 없습니다.
         total_loss_accum += total_loss.item()
         main_loss_accum += main_loss.item()
-        cl_loss_accum += cl_loss.item()
         
         pbar.set_postfix({
             'Loss': f"{total_loss.item():.4f}",
-            'Main': f"{main_loss.item():.4f}",
-            'CL': f"{cl_loss.item():.4f}"
+            'Main': f"{main_loss.item():.4f}"
         })
         
+        # 100번 단위 로깅도 미니배치(384) 기준 100번이 됩니다.
         if batch_idx % 100 == 0:
             wandb.log({
-                "Train/Main_Loss_Step": main_loss.item(),
-                "Train/CL_Loss_Step": cl_loss.item(),
-                "Step": epoch * len(dataloader) + batch_idx
+                "Train/Main_Loss": main_loss.item(), # Unscaled Loss
             })
 
+        # mini-batch deloc
+        del output_1, flat_output, flat_targets, flat_is_last, flat_user_ids
+        del main_loss, total_loss, scaled_loss
+        
+        # 2. 부피가 큰 입력 피처 텐서 일괄 해제
+        del item_ids, target_ids, padding_mask, time_bucket_ids, pretrained_vecs
+        del type_ids, color_ids, graphic_ids, section_ids
+        del age_bucket, price_bucket, cnt_bucket, recency_bucket
+        del channel_ids, club_status_ids, news_freq_ids, fn_ids, active_ids, cont_feats
+        del recency_offset, current_week
+        if 'flat_user_emb' in locals():
+            del flat_user_emb, all_item_emb, norm_item_embeddings
+        
+    # 에포크 종료 후 평균 Loss 계산
     avg_loss = total_loss_accum / len(dataloader)
     avg_main = main_loss_accum / len(dataloader)
-    avg_cl = cl_loss_accum / len(dataloader)
+    avg_cl = cl_loss_accum / len(dataloader) if cl_loss_accum > 0 else 0.0
 
     # Gate Weights Logging
     with torch.no_grad():
@@ -894,17 +1018,26 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
 # =====================================================================
 # Main Execution Pipeline
 # =====================================================================
-def run_pipeline():
-    """Airflow DAG나 MLflow Run에서 직접 호출하는 엔트리 포인트"""
-    print("🚀 Starting User Tower Training Pipeline...")
+
+def run_resume_pipeline_v2():
+    """기존 체크포인트에서 이어서 학습(Fine-tuning)하는 파이프라인"""
+    print("🚀 Starting User Tower RESUME Pipeline...")
     
-    
-    SEQ_LABELS = ['item_id', 'time', 'type', 'color', 'graphic', 'section']
-    STATIC_LABELS = ['age', 'price', 'cnt', 'recency', 'channel', 'club', 'news', 'fn', 'active', 'cont']
+
+    SEQ_LABELS = ['item_id', 'time', 'type', 'color', 'graphic', 'section', 'recency_curr', 'week_curr']
+    STATIC_LABELS = [
+        'age', 'price', 'cnt', 'recency',      # Buckets (4)
+        'channel', 'club', 'news', 'fn', 'active', # Categoricals (5)
+        'cont_price_std', 'cont_last_diff', 'cont_repurch', 'cont_weekend' # Continuous (4) [추가]
+    ] 
     # 1. Config & Env
     cfg = PipelineConfig()
     device = setup_environment()
     processor, val_processor, cfg = prepare_features(cfg)
+    
+    # 1-1. h-params 
+    cfg.lr = 1e-3
+    item_finetune_lr = cfg.lr * 0.05
     
     # item metadata cfg
     HASH_SIZE = 1000
@@ -912,10 +1045,11 @@ def run_pipeline():
     cfg.num_colors = HASH_SIZE
     cfg.num_graphics = HASH_SIZE
     cfg.num_sections = HASH_SIZE
+    TARGET_VAL_PATH = os.path.join(cfg.base_dir, "features_target_val.parquet")
+
     
     # 2. Data 가져오기
     aligned_vecs = load_aligned_pretrained_embeddings(processor, cfg.model_dir, cfg.pretrained_dim)
-    # ❌ full_item_embeddings = aligned_vecs.to(device) # 더 이상 사용하지 않음
     
     item_state_dict = load_item_tower_state_dict(cfg.model_dir, cfg.item_tower_pth_name, device)
     log_q_tensor = processor.get_logq_probs(device)
@@ -923,77 +1057,75 @@ def run_pipeline():
     item_metadata_tensor = load_item_metadata_hashed(processor, cfg.base_dir, hash_size=HASH_SIZE)
     processor.i_side_arr = item_metadata_tensor.numpy()
     
-    train_loader = create_dataloaders(processor, cfg, aligned_vecs, is_train=True)
-    val_loader = create_dataloaders(val_processor, cfg, aligned_vecs, is_train=False)
+    train_loader = create_dataloaders(processor, cfg, "2020-09-16", aligned_vecs, is_train=True)
+    val_loader = create_dataloaders(val_processor, cfg, "2020-09-22",aligned_vecs, is_train=False)
     dataset_peek(train_loader.dataset, processor)
     
     
     
         
     wandb.init(
-        project="SASRec-User-Tower-causality-Optimization", # 프로젝트명
-        name=f"run_lr_{cfg.lr}_epoch_{cfg.epochs}", # 실험 이름
+        project="SASRec-User-Tower-causality-Optimization-v2", # 프로젝트명
+        name=f"run_lr_{cfg.lr}_epoch_{cfg.epochs}_time_sperad_f1", # 실험 이름
         config=cfg.__dict__ # 하이퍼파라미터 저장
     )
     
     
     # -----------------------------------------------------------
-    # 3. Models & Optimizer Setup (초기 상태: Epoch 1용 세팅)
+    # 3. Models & Optimizer Setup (체크포인트 로드)
     # -----------------------------------------------------------
     user_tower, item_tower = setup_models(cfg, device, item_state_dict, log_q_tensor)
     TARGET_VAL_PATH = os.path.join(cfg.base_dir, "features_target_val.parquet")
     
-    # 💡 [핵심 반영] 아까 만든 깔끔한 메서드로 사전학습 벡터 강제 주입!
-    item_tower.init_from_pretrained(aligned_vecs.to(device))
+    # 💡 이전 Best 가중치 로드
+    user_checkpoint_path = os.path.join(cfg.model_dir, "best_user_tower_v2_time.pth")
+    item_checkpoint_path = os.path.join(cfg.model_dir, "best_item_tower_v2_time.pth")
     
-    # 💡 [초기화] Epoch 1에서는 User Tower만 학습하도록 Item Tower 완전 동결
-    item_tower.set_freeze_state(True)
-    print(f"❄️ Epoch 1: Item Tower FROZEN! (User Tower LR: {cfg.lr})")
+    user_tower.load_state_dict(torch.load(user_checkpoint_path, map_location=device))
+    item_tower.load_state_dict(torch.load(item_checkpoint_path, map_location=device))
+    print(f"✅ Successfully loaded best weights from disk for resuming!")
     
-    # User Tower만 포함된 Optimizer 생성
-    optimizer = torch.optim.AdamW(user_tower.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # 💡 이미 학습이 진행된 상태이므로, 아이템 타워 동결 없이 처음부터 Joint Training
+    item_tower.set_freeze_state(False)
+    print(f"🔥 Resuming Joint Training! (User LR: {cfg.lr}, Item LR: {item_finetune_lr})")
+    
+    # User와 Item 파라미터를 처음부터 함께 묶어 옵티마이저 생성
+    optimizer = torch.optim.AdamW([
+        {'params': user_tower.parameters(), 'lr': cfg.lr},
+        {'params': item_tower.parameters(), 'lr': item_finetune_lr}
+    ], weight_decay=cfg.weight_decay)
+    
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
     
-    # 💡 [스케줄러] Validation 지표(Recall@100)를 보고 정체 시 학습률 감소 (patience=1)
+    # 💡 [스케줄러 변경] threshold 0.001 추가 및 patience 약간 여유 있게(3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=1
+        optimizer, mode='max', factor=0.5, patience=2, threshold=0.001
     )
     
-    # Best Model 트래킹 변수
-    best_recall_100 = 0.0
+    # 💡 이전 최고 기록(20.08)을 수동으로 입력해주면 기존 기록부터 이어갈 수 있지만,
+    # 새로운 체크포인트를 만들기 위해 0.0부터 시작합니다. (필요 시 20.08로 변경 가능)
+    best_recall_100 = 0.0 
 
     # -----------------------------------------------------------
     # 4. Training Loop
     # -----------------------------------------------------------
     for epoch in range(1, cfg.epochs + 1):
         
-        # 💡 [동적 Unfreeze] Epoch 2 진입 시 딱 한 번 실행하여 Joint Training 시작
-        if epoch == 2:
-            print("\n🔥 [Dynamic Unfreeze] Epoch 2: Item Tower Joint Training 시작!")
-            item_tower.set_freeze_state(False)
-            item_finetune_lr = cfg.lr * 0.05 # 아이템은 매우 미세하게만 조정 (User LR의 5%)
-            
-            # 기존 옵티마이저에 아이템 타워의 파라미터 그룹을 런타임에 동적으로 추가
-            optimizer.add_param_group({
-                'params': item_tower.parameters(), 
-                'lr': item_finetune_lr
-            })
-            print(f"   - User Tower LR: {cfg.lr}")
-            print(f"   - Item Tower LR: {item_finetune_lr} (Fine-tuning mode)")
-
         # ------------------- 훈련 (Train) -------------------
         avg_loss = train_user_tower_all_time(
             epoch=epoch,
             model=user_tower,
-            item_tower=item_tower, # 정적 벡터 대신 모델 객체 자체를 넘김
+            item_tower=item_tower, 
             log_q_tensor=log_q_tensor,
             dataloader=train_loader,
             optimizer=optimizer,
             scaler=scaler,
             cfg=cfg,
             device=device,
-            seq_labels = SEQ_LABELS,
-            static_labels = STATIC_LABELS
+            hard_neg_pool_tensor=None, # 하드 네거티브가 필요하다면 이 부분을 수정
+            scheduler=None,
+            seq_labels=SEQ_LABELS,
+            static_labels=STATIC_LABELS,
         )
         
         # ------------------- 평가 (Evaluate) -------------------
@@ -1016,117 +1148,133 @@ def run_pipeline():
             print(f"🌟 [New Best!] Recall@100 updated: {best_recall_100:.2f}% -> {current_recall_100:.2f}%")
             best_recall_100 = current_recall_100
             
-            # 최고 성능 달성 시 파라미터 덮어쓰기 저장
-            torch.save(user_tower.state_dict(), os.path.join(cfg.model_dir, "best_user_tower_c.pth"))
-            torch.save(item_tower.state_dict(), os.path.join(cfg.model_dir, "best_item_tower_c.pth"))
-            print("   💾 Best model weights saved to disk.")
+            # 💡 [수정] 새로운 이름으로 체크포인트 저장
+            torch.save(user_tower.state_dict(), os.path.join(cfg.ft_model_dir, "best_user_tower_v2_time_ft.pth"))
+            torch.save(item_tower.state_dict(), os.path.join(cfg.ft_model_dir, "best_item_tower_v2_time_ft.pth"))
+            print("   💾 Best model weights saved to disk (v1/v2).")
         else:
             print(f"   - (Current Best: {best_recall_100:.2f}%)")
             
-    print("\n🎉 Pipeline Execution Finished Successfully!")
+    print("\n🎉 Resume Pipeline Execution Finished Successfully!")
 
-def run_resume_pipeline(resume_epoch=6, last_best_recall=9.69):
-    """저장된 모델을 불러와 Epoch 6부터 재학습을 진행하는 엔트리 포인트"""
-    print(f"🚀 Resuming User Tower Training from Epoch {resume_epoch}...")
-    # 모델 구조와 일치하는 이름표 정의
+
+
+def run_pipeline_opt_v2():
+    """Airflow DAG나 MLflow Run에서 직접 호출하는 엔트리 포인트"""
+    print("🚀 Starting User Tower Training Pipeline...")
     
+    SEQ_LABELS = ['item_id', #'time',
+                  'type', #'color', 'graphic', 'section', 
+                  'recency_curr', 'week_curr']
+    STATIC_LABELS = [
+        'age', 'price', #'cnt', 'recency',      # Buckets (4)
+        'channel', 'club', 'news', 'fn', 'active', # Categoricals (5)
+        'cont_price_std', 'cont_last_diff', 'cont_repurch', 'cont_weekend' # Continuous (4) [추가]
+    ] 
     
-    
-    
-    
-    
-    SEQ_LABELS = ['item_id', 'time', 'type', 'color', 'graphic', 'section']
-    STATIC_LABELS = ['age', 'price', 'cnt', 'recency', 'channel', 'club', 'news', 'fn', 'active', 'cont']
-    
+    # 1. Config & Env
     cfg = PipelineConfig()
     device = setup_environment()
     processor, val_processor, cfg = prepare_features(cfg)
-    # processor.analyze_distributions()
-    HASH_SIZE = 1000 
+    
+    # 1-1. h-params 세팅 (Epoch 대폭 상향)
+    cfg.lr = 2e-3
+    cfg.epochs = 40  # 💡 [핵심] 충분한 탐색을 위해 에포크를 50으로 상향 (실제론 Early Stop 됨)
+    
+    # item metadata cfg
+    HASH_SIZE = 1000
     cfg.num_prod_types = HASH_SIZE
     cfg.num_colors = HASH_SIZE
     cfg.num_graphics = HASH_SIZE
     cfg.num_sections = HASH_SIZE
-    # 아이템 개수도 processor에서 가져와서 정확히 매칭 (매우 중요)
-    cfg.num_items = len(processor.item2id)
-    aligned_vecs = load_aligned_pretrained_embeddings(processor, cfg.model_dir, cfg.pretrained_dim)
-    log_q_tensor = processor.get_logq_probs(device)
-    item_metadata_tensor = load_item_metadata_hashed(processor, cfg.base_dir, hash_size=HASH_SIZE)
-    processor.i_side_arr = item_metadata_tensor.numpy()
-    
-    
-    wandb.init(
-        project="SASRec-User-Tower-Optimization", # 프로젝트명
-        name=f"run_lr_{cfg.lr}_epoch_{cfg.epochs}", # 실험 이름
-        config=cfg.__dict__ # 하이퍼파라미터 저장
-    )
-    
-    
-    train_loader = create_dataloaders(processor, cfg, aligned_vecs, is_train=True)
-    val_loader = create_dataloaders(val_processor, cfg, aligned_vecs, is_train=False)
-    
-    # 2. 모델 생성
-    # item_state_dict는 초기화용이므로 비워두거나 기본 로드 후 가중치를 덮어씌웁니다.
-    user_tower, item_tower = setup_models(cfg, device, {}, log_q_tensor)
-    
-    # 3. [핵심] 가중치 불러오기 (Best 모델 로드)
-    print("📂 Loading best weights for Resume...")
-    user_weight_path = os.path.join(cfg.model_dir, "best_user_tower_fout.pth")
-    item_weight_path = os.path.join(cfg.model_dir, "best_item_tower_fout.pth")
-
-    if os.path.exists(user_weight_path) and os.path.exists(item_weight_path):
-        # torch.load는 파일만 읽고, strict 옵션은 load_state_dict에 줍니다.
-        user_state_dict = torch.load(user_weight_path, map_location=device)
-        user_tower.load_state_dict(user_state_dict, strict=False) 
-        
-        item_state_dict = torch.load(item_weight_path, map_location=device)
-        item_tower.load_state_dict(item_state_dict, strict=False)
-        
-        print("✅ Successfully loaded best weights from disk (Feature Gates Initialized).")
-        # 4. Optimizer & Scheduler 설정
-        # 재학습 시에는 Item Tower를 바로 학습 가능 상태로 둡니다.
-        item_tower.set_freeze_state(True)
-    
-    # 두 타워의 파라미터를 처음부터 나누어 관리
-    user_lr = 5e-4   # 재학습이므로 기존 LR보다 절반 정도로 낮게 시작하는 것을 추천
-    item_lr = user_lr * 0.05
-    
-    optimizer = torch.optim.AdamW([
-        {'params': user_tower.parameters(), 'lr': user_lr},
-        {'params': item_tower.parameters(), 'lr': item_lr}
-    ], weight_decay=cfg.weight_decay)
-    
-    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='max',          # Recall@100 기준
-        factor=0.3,          # [조정] 0.5보다 조금 더 과감하게 깎아서 정착 유도
-        patience=3,          # [조정] 2에서 3으로 증가. HNM은 적응 기간이 필요함
-        threshold=1e-4,      # 미세한 개선도 인정
-        min_lr=1e-6,         # 최소 학습률 하한선
-    )
-    
-    best_recall_100 = last_best_recall # 9.69% 부터 시작
     TARGET_VAL_PATH = os.path.join(cfg.base_dir, "features_target_val.parquet")
 
-    # 5. Training Loop (Epoch 6 ~ 10 등)
-    total_epochs = resume_epoch + 4 # 예: 5에포크 더 학습
-    for epoch in range(resume_epoch, total_epochs + 1):
-        
-        avg_loss = train_user_tower(
+    # 2. Data 가져오기
+    aligned_vecs = load_aligned_pretrained_embeddings(processor, cfg.model_dir, cfg.pretrained_dim)
+    
+    item_state_dict = load_item_tower_state_dict(cfg.model_dir, cfg.item_tower_pth_name, device)
+    log_q_tensor = processor.get_logq_probs(device)
+    
+    item_metadata_tensor = load_item_metadata_hashed(processor, cfg.base_dir, hash_size=HASH_SIZE)
+    processor.i_side_arr = item_metadata_tensor.numpy()
+    val_processor.i_side_arr = processor.i_side_arr
+    
+    train_loader = create_dataloaders(processor, cfg, "2020-09-16", aligned_vecs, is_train=True)
+    val_loader = create_dataloaders(val_processor, cfg, "2020-09-22", aligned_vecs, is_train=False)
+    dataset_peek_v3(train_loader.dataset, processor)
+    
+    print(f"✅ Final Model Config - Total Hash Nodes: {cfg.num_prod_types + cfg.num_colors + cfg.num_graphics + cfg.num_sections}")
+
+    wandb.init(
+        project="SASRec-User-Tower-causality-Optimization-v2",
+        name=f"run_lr_{cfg.lr}_epoch_{cfg.epochs}_shuffle_session_correction", 
+        config=cfg.__dict__ 
+    )
+    
+    # -----------------------------------------------------------
+    # 3. Models & Optimizer Setup (초기 상태: Epoch 1용 세팅)
+    # -----------------------------------------------------------
+    user_tower, item_tower = setup_models(cfg, device, item_state_dict, log_q_tensor)
+    item_tower.init_from_pretrained(aligned_vecs.to(device))
+    item_tower.set_freeze_state(True)
+    print(f"❄️ Epoch 1: Item Tower FROZEN! (User Tower LR: {cfg.lr})")
+    optimizer = torch.optim.AdamW(
+        user_tower.parameters(), 
+        lr=cfg.lr, 
+        weight_decay=cfg.weight_decay,
+        fused=True  # 💡 다중 CUDA 커널을 하나로 융합하여 속도 극대화
+    )
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
+    
+    # 💡 [신규 스케줄러 & 얼리스탑 세팅] 
+    total_steps = len(train_loader) * cfg.epochs
+    warmup_steps = int(total_steps * 0.05) # 전체 훈련의 5% 구간 웜업 (50 에포크 기준)
+    
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01)
+    
+    # Patience 7 부여 (7 에포크 동안 안 오르면 종료)
+    early_stopping = EarlyStopping(patience=5, mode='max')
+
+    # -----------------------------------------------------------
+    # 4. Training Loop
+    # -----------------------------------------------------------
+    for epoch in range(1, cfg.epochs + 1):
+        # 💡 [Dynamic Unfreeze 시점 변경] 에포크가 늘어났으므로 5 에포크에 파인튜닝 시작
+        if epoch == 5: 
+            print("\n🔥 [Dynamic Unfreeze] Epoch 4: Item Tower Joint Training 시작!")
+            item_tower.set_freeze_state(False)
+            item_finetune_lr = cfg.lr * 0.05 
+            
+            optimizer.add_param_group({
+                'params': item_tower.parameters(), 
+                'lr': item_finetune_lr 
+            })
+            print(f"   - User Tower LR: {cfg.lr}")
+            print(f"   - Item Tower LR: {item_finetune_lr} (Fine-tuning mode)")
+
+        # ------------------- 훈련 (Train) -------------------
+        avg_loss = train_user_tower_all_time(
             epoch=epoch,
             model=user_tower,
-            item_tower=item_tower,
+            item_tower=item_tower, 
             log_q_tensor=log_q_tensor,
             dataloader=train_loader,
             optimizer=optimizer,
             scaler=scaler,
             cfg=cfg,
             device=device,
+            hard_neg_pool_tensor=None,
+            scheduler=scheduler, # 배치 단위 스텝을 위해 전달
             seq_labels = SEQ_LABELS,
-            static_labels = STATIC_LABELS
+            static_labels = STATIC_LABELS,
         )
         
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        
+        # ------------------- 평가 (Evaluate) -------------------
         val_metrics = evaluate_model(
             model=user_tower, 
             item_tower=item_tower, 
@@ -1134,24 +1282,35 @@ def run_resume_pipeline(resume_epoch=6, last_best_recall=9.69):
             target_df_path=TARGET_VAL_PATH,
             device=device,
             processor=processor,
-            k_list=[20, 100, 500]
+            k_list=[10, 20, 100, 500]
         )
         
         current_recall_100 = val_metrics.get('Recall@100', 0.0)
-        scheduler.step(current_recall_100)
         
-        if current_recall_100 > best_recall_100:
-            print(f"🌟 [New Best!] Recall@100 updated: {best_recall_100:.2f}% -> {current_recall_100:.2f}%")
-            best_recall_100 = current_recall_100
-            torch.save(user_tower.state_dict(), os.path.join(cfg.model_dir, "best_user_tower_hmn.pth"))
-            torch.save(item_tower.state_dict(), os.path.join(cfg.model_dir, "best_item_tower_hmn.pth"))
-            print("💾 Best model weights updated.")
-        else:
-            print(f" - (Current Best: {best_recall_100:.2f}%)")
-
-    print("\n🎉 Resume Training Finished!")
+        # ------------------- 스케줄러 & Best Model 저장 -------------------
+        early_stopping(current_recall_100)
+        
+        if early_stopping.is_best:
+            print(f"🌟 [New Best!] Recall@100 updated: {current_recall_100:.2f}%")
+            
+            # 최고 성능 달성 시 파라미터 덮어쓰기 저장
+            torch.save(user_tower.state_dict(), os.path.join(cfg.model_dir, "best_user_tower_v3_allseq_session_v2_test.pth"))
+            torch.save(item_tower.state_dict(), os.path.join(cfg.model_dir, "best_item_tower_v3_allseq_session_v2.test_pth"))
+            print("   💾 Best model weights saved to disk.")
+            
+        if early_stopping.early_stop:
+            print(f"\n🛑 조기 종료 발동! {early_stopping.patience} Epoch 동안 Recall@100이 개선되지 않았습니다.")
+            print(f"🏆 최종 최고 Recall@100: {early_stopping.best_score:.2f}%")
+            break
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+            
+    print("\n🎉 Pipeline Execution Finished Successfully!")
 
 if __name__ == "__main__":
     # 5에포크까지 학습했으므로 6번부터 재개
-    #run_resume_pipeline(resume_epoch=26, last_best_recall=17.55)
-    run_pipeline()
+    #run_resume_pipeline(resume_epoch=16, last_best_recall=22.60)
+    run_pipeline_opt_v2()
+    #run_resume_pipeline_v2()
