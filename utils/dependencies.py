@@ -6,7 +6,7 @@ from database import SessionLocal
 #from inference import RecommendationService
 from item_tower import HybridItemTower, OptimizedItemTower
 from utils.vocab import get_std_vocab_size, get_std_field_keys
-from gnn_model.gnn_cl_noise_cp import SimGCL
+
 # 1. 모델 인스턴스를 저장할 전역 변수
 global_encoder: Optional[HybridItemTower] = None
 global_projector: Optional[OptimizedItemTower] = None

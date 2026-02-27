@@ -552,3 +552,128 @@ def inbatch_corrected_logq_loss_with_hard_neg_margin(
     loss = F.cross_entropy(logits, labels)
     
     return (loss, metrics) if return_metrics else loss
+
+
+
+def inbatch_corrected_logq_loss_with_dynamic_soft_labels(
+    user_emb, item_tower_emb, target_ids, user_ids, log_q_tensor,
+    last_hard_neg_ids=None,  # [B, num_hn]
+    flat_is_last=None,       # [N]
+    temperature=0.1, 
+    lambda_logq=1.0,         
+    alpha=1,               
+    margin=0.05,             
+    return_metrics=True,
+    # 💡 [신규] 동적 라벨 스무딩 파라미터
+    K_peers=3, # 이 유사도 이상인 유저들만 '취향 동기화'로 인정
+    max_smoothing_mass=0.2,     # Soft Positive에 나눠줄 최대 확률 총합 (내 진짜 정답은 최소 0.8 보장)
+    tau_soft=0.1
+):
+    N = user_emb.size(0)
+    device = user_emb.device
+    metrics = {}
+    # -----------------------------------------------------------
+    # 0. Similarity Matrix 생성 (Raw Score 보존)
+    # -----------------------------------------------------------
+    batch_item_emb = item_tower_emb[target_ids] 
+    # [N, N] 행렬: raw_sim은 마진이나 온도가 적용되지 않은 순수 유사도
+    raw_sim = torch.matmul(user_emb, batch_item_emb.T) 
+    
+    # 💡 [메트릭 계산 1] 진짜 정답(Positive)의 유사도 평균
+    if return_metrics:
+        with torch.no_grad():
+            metrics['sim/pos'] = torch.diag(raw_sim).mean().item()
+            
+    # -----------------------------------------------------------
+    # 1. In-batch Logits & Positive Margin 적용 (기존 동일)
+    # -----------------------------------------------------------
+    sim_matrix = raw_sim.clone()
+    
+    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
+    sim_matrix[diag_mask] = sim_matrix[diag_mask] - margin
+    
+    logits = sim_matrix / temperature
+
+    if lambda_logq > 0.0:
+        batch_log_q = log_q_tensor[target_ids]
+        logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
+
+    # 마스킹 방어막
+    same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
+    same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
+    false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
+    logits.masked_fill_(false_neg_mask, float('-inf'))
+
+    # (중간 Hard Negative 관련 로직 생략 - 기존 코드와 완벽히 동일하게 유지)
+    # ... [기존 Hard Negative 로직 병합 코드] ...
+    # 편의상 여기서는 in-batch 행렬(N x N)에 대해서만 타겟을 만든다고 가정합니다.
+    # 만약 num_hn이 추가되어 logits가 [N, N + num_hn]이 되었다면, 
+    # targets 행렬도 torch.zeros_like(logits)로 생성하면 됩니다.
+    
+    # -----------------------------------------------------------
+    # 🚀 3. [핵심] 유저 인텐트 유사도 기반 Soft Positive Target 생성
+    # -----------------------------------------------------------
+
+    # 3-1. 유저 간 코사인 유사도 계산
+    user_emb_norm = F.normalize(user_emb, p=2, dim=-1)
+    intent_sim = torch.matmul(user_emb_norm, user_emb_norm.T)
+    
+    # 3-2. 안전장치: 나 자신(대각선)과, 내 세션에 있던 아이템을 고른 유저는 후보에서 제외
+    invalid_peer_mask = diag_mask | false_neg_mask
+    intent_sim.masked_fill_(invalid_peer_mask, float('-inf'))
+    
+    # 3-3. Top-K 추출: 가장 유사도 높은 K명의 점수와 위치를 뽑아냄
+    # topk_sim: [N, K], topk_idx: [N, K]
+    topk_sim, topk_idx = torch.topk(intent_sim, k=K_peers, dim=1)
+    
+
+    if return_metrics:
+        with torch.no_grad():
+            # raw_sim에서 동료들이 고른 아이템의 위치 점수를 추출
+            peer_item_sims = torch.gather(raw_sim, 1, topk_idx)
+            # -inf인 경우는 유효한 동료가 없는 것이므로 필터링하여 평균 계산
+            valid_peer_sims = peer_item_sims[topk_sim > float('-inf')]
+            if valid_peer_sims.numel() > 0:
+                metrics['sim/soft_pos'] = valid_peer_sims.mean().item()
+            else:
+                metrics['sim/soft_pos'] = 0.0
+    
+    
+    valid_peer_mask = topk_sim > -1e8 
+    
+    # 3-4. 안전한 Softmax 계산
+    # 일단 0으로 꽉 찬 텐서를 준비합니다.
+    peer_weights = torch.zeros_like(topk_sim)
+    
+    # 유효한 동료가 '최소 1명 이상' 존재하는 유저(Row)들만 찾아냅니다.
+    has_valid_peers = valid_peer_mask.any(dim=1)
+    
+    if has_valid_peers.any():
+        # 전부 -inf가 아닌, 안전한 행(Row)에 대해서만 Softmax를 계산합니다.
+        safe_sims = topk_sim[has_valid_peers] / tau_soft
+        peer_weights[has_valid_peers] = F.softmax(safe_sims, dim=1) * max_smoothing_mass
+        
+        # K명 중 정상 1명, 더미 2명이 섞여 있을 경우를 대비해, 더미의 확률을 확실하게 0으로 날려버림
+        peer_weights = peer_weights * valid_peer_mask.float()
+    
+    
+    # 3-5. 타겟 텐서(targets)에 할당
+    targets = torch.zeros_like(logits)
+    targets.scatter_add_(1, topk_idx, peer_weights)
+    
+    # 3-6. 진짜 정답 대각선 채우기 (나머지 질량)
+    true_target_probs = 1.0 - targets.sum(dim=1)
+    targets[diag_mask] = true_target_probs
+    
+    # -----------------------------------------------------------
+    # 4. Final Loss: 확률 분포(Soft Targets)를 활용한 Cross Entropy
+    # -----------------------------------------------------------
+    # PyTorch 1.10 이상부터는 labels 인자에 1D index 대신 2D 확률 분포를 바로 넣을 수 있습니다.
+    # 수식: Loss = - Σ (target_prob * log(pred_prob))
+    loss = F.cross_entropy(logits, targets)
+    if return_metrics:
+        metrics['loss/inbatch'] = loss.item()
+        # 정답에 준 확률 평균 (Confidence)
+        metrics['prob/true_pos'] = true_target_probs.mean().item()
+    
+    return (loss, metrics) if return_metrics else loss

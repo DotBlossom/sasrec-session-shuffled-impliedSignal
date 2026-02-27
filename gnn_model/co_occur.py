@@ -1,4 +1,5 @@
 import os
+from matplotlib import pyplot as plt
 import pandas as pd
 import torch
 import numpy as np
@@ -111,7 +112,7 @@ def calculate_npmi_sparse(edge_index, num_users, num_items_total):
     
     NPMI_matrix = sp.coo_matrix((npmi, (row, col)), shape=(num_items_total, num_items_total)).tocsr()
     print(f" -> NPMI Done! ({time.time() - start:.2f}s)")
-    return NPMI_matrix
+    return C, NPMI_matrix
 
 # 2. Hard Negative Mining (VRAM 최적화 및 0번 패딩 보호)
 def mine_hard_negatives_optimized(V_embeddings, NPMI_matrix, num_items_total, top_k=50, chunk_size=512):
@@ -615,6 +616,51 @@ def inspect_hard_neg_pool_quality(npy_path):
     for i in range(len(hist)):
         print(f"   [{bins[i]:02d}~{bins[i+1]:02d}]: {hist[i]:,} items")
     print("-" * 40)
+    
+    
+import seaborn as sns
+    
+def visualize_item_stats(C_matrix, NPMI_matrix, n_items_to_show=50):
+    """
+    C_matrix: 아이템-아이템 동시출현 행렬 (R.T.dot(R))
+    NPMI_matrix: 계산된 NPMI 행렬
+    n_items_to_show: 시각화할 상위 아이템 개수 (0~n)
+    """
+    
+    # 1. 공동구매 빈도 히트맵 (Co-occurrence Count)
+    # R^T * R 결과인 C 행렬의 일부를 시각화합니다.
+    plt.figure(figsize=(12, 10))
+    # sparse matrix일 경우 .toarray()로 변환
+    subset_c = C_matrix[:n_items_to_show, :n_items_to_show].toarray()
+    
+    sns.heatmap(subset_c, cmap="YlGnBu", annot=False)
+    plt.title(f"Item Co-occurrence Heatmap (Top {n_items_to_show} items)")
+    plt.xlabel("Item ID")
+    plt.ylabel("Item ID")
+    plt.savefig("item_cooccurrence_heatmap.png")
+    
+    # 2. NPMI 점수 히트맵 (Normalized PMI)
+    # -1(전혀 같이 안 나타남) ~ 1(항상 같이 나타남) 사이의 값을 가집니다.
+    plt.figure(figsize=(12, 10))
+    subset_npmi = NPMI_matrix[:n_items_to_show, :n_items_to_show].toarray()
+    
+    # NPMI는 0을 기준으로 양수(연관), 음수(비연관)을 보기 위해 RdYlBu_r 맵 사용
+    sns.heatmap(subset_npmi, cmap="RdYlBu_r", center=0, annot=False)
+    plt.title(f"Item NPMI Heatmap (Top {n_items_to_show} items)")
+    plt.xlabel("Item ID")
+    plt.ylabel("Item ID")
+    plt.savefig("item_npmi_heatmap.png")
+    
+    # 3. 공동구매 빈도 분포 (Distribution)
+    # 얼마나 많은 아이템 쌍들이 강하게 결합되어 있는지 확인합니다.
+    plt.figure(figsize=(10, 6))
+    counts = C_matrix.data # 0이 아닌 값들만 추출
+    plt.hist(counts, bins=50, color='skyblue', edgecolor='black', log=True)
+    plt.title("Distribution of Co-occurrence Counts (Log Scale)")
+    plt.xlabel("Number of Shared Users")
+    plt.ylabel("Frequency (Log)")
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.savefig("cooccurrence_distribution.png")
 if __name__ == "__main__":
     train_proc = FeatureProcessor(user_path, item_path, seq_path)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -627,72 +673,14 @@ if __name__ == "__main__":
         'top_k': 50
     }
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    pool_save_path = os.path.join(NEW_CONFIG['cache_dir'], 'hard_neg_pool_direct.npy')
-    
-    # [Step 1] 모델 가중치 로드 및 GPU 전송 (이미 검증됨)
-    print(f"🔄 Loading tuned weights from {os.path.basename(NEW_CONFIG['model_pth'])}...")
-    state_dict = torch.load(NEW_CONFIG['model_pth'], map_location='cpu')
-    item_weights = state_dict['item_matrix.weight'].to(device) # Shape: [47063, 128]
-    num_items_total = item_weights.shape[0]
 
     # [Step 2] 그래프 데이터 로드 및 인덱스 치환
     # raw_graph.json의 아이템 ID를 processor.item2id(1~N)로 바꿉니다.
     print(f"🔄 Re-mapping raw graph to Processor indices...")
-    edge_index, num_users, _, _, raw_item2id = load_and_process_data(
+    edge_index, num_users, num_items_total, _, raw_item2id = load_and_process_data(
         NEW_CONFIG['raw_graph_path'], NEW_CONFIG['cache_dir']
     )
     
-    # raw_idx -> string_id -> processor_idx 매핑 테이블 생성
-    raw_idx_to_str = {v: str(k) for k, v in raw_item2id.items()}
-    
-    src_raw, dst_raw = edge_index[0].numpy(), edge_index[1].numpy()
-    aligned_src, aligned_dst = [], []
-    
-    for u, i in zip(src_raw, dst_raw):
-        item_str = raw_idx_to_str[i]
-        if item_str in train_proc.item2id:
-            aligned_src.append(u)
-            aligned_dst.append(train_proc.item2id[item_str])
-            
-    aligned_edge_index = torch.tensor([aligned_src, aligned_dst], dtype=torch.long)
-    print(f"✅ Graph aligned. Edges: {len(aligned_src)}")
 
-    # [Step 3] NPMI 및 마이닝 실행
-    NPMI_matrix = calculate_npmi_sparse(aligned_edge_index, num_users, num_items_total)
-    
-    cache_dir = r'D:\trainDataset\localprops\cache'
-    ultimate_pool_save_path = os.path.join(cache_dir, 'hard_neg_pool_ultimate.npy')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    item_sales_counts = np.bincount(
-        aligned_edge_index[1].numpy(), 
-        minlength=train_proc.num_items + 1
-    )
-    # 2. Ultimate 하드 네거티브 마이닝 실행
-    # (weights, NPMI_matrix, processor, item_sales_counts가 이미 로드되어 있다고 가정)
-    hard_neg_pool_ultimate = mine_hard_negatives_ultimate(
-        V_embeddings=item_weights,           # 모델 아이템 가중치
-        NPMI_matrix=NPMI_matrix,                   # NPMI 희소 행렬
-        item_side_arr=train_proc.i_side_arr,        # 아이템 사이드 정보 (Type ID 포함)
-        item_sales_counts=item_sales_counts,       # 아이템별 판매량 배열
-        num_items_total=train_proc.num_items + 1,   # 전체 아이템 수 (0번 패딩 포함)
-        min_sales=5,                              # [핵심] 판매량 10개 미만 유령 상품 필터링
-        top_k=50,                                  # 타겟당 50개 추출
-        chunk_size=512                             # 8GB VRAM 최적화 청크 사이즈
-    )
-    np.save(ultimate_pool_save_path, hard_neg_pool_ultimate)
-    print(f"🚀 [Success] Ultimate Hard Negative Pool saved to:\n{ultimate_pool_save_path}")
-    
-    
-    analyze_hn_with_popularity(
-        processor=train_proc, 
-        pool_path=r'D:\trainDataset\localprops\cache\hard_neg_pool_ultimate.npy',
-        model_path=r'C:\Users\candyform\Desktop\inferenceCode\models\best_item_tower_c.pth',
-        raw_graph_path=r'D:\trainDataset\localprops\cache\raw_graph.json',
-        cache_dir=r'D:\trainDataset\localprops\cache'
-    )
-    inspect_hard_neg_pool_quality(r'D:\trainDataset\localprops\cache\hard_neg_pool_ultimate.npy')
-    #compare_hard_vs_simple_knn(
-    #    pool_path=r'D:\trainDataset\localprops\cache\hard_neg_pool_direct.npy',
-    #    model_path=r'C:\Users\candyform\Desktop\inferenceCode\models\best_item_tower_c.pth'
-    #)
+    C, NPMI_matrix = calculate_npmi_sparse(edge_index, num_users, num_items_total)
+    visualize_item_stats(C, NPMI_matrix, n_items_to_show=50)
