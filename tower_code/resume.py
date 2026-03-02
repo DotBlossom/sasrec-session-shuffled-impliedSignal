@@ -1,7 +1,11 @@
 from dataclasses import dataclass
 import gc
-    
-import os
+import os, sys
+
+
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if root_path not in sys.path:
+    sys.path.append(root_path)
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -14,6 +18,8 @@ import os
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import wandb
+
+from tower_code.params_config import PipelineConfig
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Garbage Collection
@@ -21,54 +27,10 @@ with torch.no_grad():
     torch.cuda.empty_cache()
 gc.collect()
 print(f"🧹 Memory Cleared. Allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+from tower_code.sheduler import AdaptiveHNScheduler
 
-@dataclass
-class PipelineConfig:
-# =====================================================================
-    # Paths
-    base_dir: str = "/kaggle/input/datasets/c24tw1f20/sasrec-usertower-session-shuffle"
-    model_dir: str = "/kaggle/working"
-    cache_dir: str = "/kaggle/working/cache"
-    # Hyperparameters
-    batch_size: int = 768
-    lr: float = 5e-4
-    weight_decay: float = 1e-4
-    epochs: int = 15
-    
-    # Model Args (SASRecUserTower용)
-    d_model: int = 128
-    max_len: int = 50
-    dropout: float = 0.3
-    pretrained_dim: int = 128 # 사전학습 아이템 벡터 차원 
-    nhead: int = 4
-    num_layers: int = 2
-    
-    # Loss Penalties
-    lambda_logq: float = 1.0
-    lambda_sup: float = 0.1
-    lambda_cl: float = 0.2
-   
-    # [신규] HNM 제어 파라미터
-    top_k_percent: float = 0.01 # 상위 15% 하드 네거티브 사용 (10~20% 사이 권장)
-    hnm_threshold: float = 0.90
-    hard_margin: float = 0.01
 
-    # model 관리
-    freeze_item_tower: bool = True
-    item_tower_pth_name: str = "encoder_ep03_loss0.8129.pth"
-    # 자동 할당될 메타데이터 크기
-    num_items: int = 0
-    num_prod_types: int = 0
-    num_colors: int = 0
-    num_graphics: int = 0
-    num_sections: int = 0
-    num_age_groups: int = 10
-
-    max_target_len: int = 10
-    
-    
-
-if not os.path.exists(PipelineConfig.cache_dir): os.makedirs(PipelineConfig.cache_dir)
+cfg = PipelineConfig()
 
 def setup_environment(seed: int = 42):
     """난수 고정 및 디바이스 설정 (Airflow Task 독립성 보장)"""
@@ -305,16 +267,88 @@ class SASRecDataset_v3(Dataset):
         self.now_ordinal = global_now_dt.toordinal()
         self.now_week = global_now_dt.isocalendar().week
 
+        if self.is_train: # 훈련용 데이터셋일 때만 딱 한 번 로그를 보고 싶다면!
+            self.verify_session_logic()
+            
+    def verify_session_logic(self):
+        """디버깅용: 세션 분리 및 셔플링이 정상적으로 작동하는지 1명의 유저를 뽑아 콘솔에 출력합니다."""
+        print("\n" + "="*75)
+        print("🕵️‍♂️ [Dataset Monitor] Session Grouping & Shuffling Verification")
+        print("="*75)
+        
+        # 시퀀스 길이가 5 이상인 유저 1명 찾기
+        sample_user = None
+        for uid in self.user_ids:
+            u_mapped_id = self.processor.user2id.get(uid, 0)
+            if len(self.processor.u_seqs[u_mapped_id]) > 5:
+                sample_user = uid
+                break
+                
+        if not sample_user:
+            print("충분한 시퀀스를 가진 유저가 없습니다.")
+            return
+            
+        u_mapped_id = self.processor.user2id[sample_user]
+        seq_raw = self.processor.u_seqs[u_mapped_id]
+        time_deltas_raw = self.processor.u_deltas[u_mapped_id]
+        
+        # 1. 세션 ID 생성 (수정된 로직)
+        session_ids_raw = [1]
+        for i in range(1, len(seq_raw)):
+            if time_deltas_raw[i] == time_deltas_raw[i-1]:
+                session_ids_raw.append(session_ids_raw[-1])
+            else:
+                session_ids_raw.append(session_ids_raw[-1] + 1)
+                
+        # 2. 셔플링 시뮬레이션 (수정된 로직 적용, 무조건 섞이도록 강제)
+        input_indices = list(range(len(seq_raw)))
+        grouped_indices = []
+        current_group = [input_indices[0]]
+        for i in range(1, len(input_indices)):
+            if time_deltas_raw[input_indices[i]] == time_deltas_raw[input_indices[i-1]]:
+                current_group.append(input_indices[i])
+            else:
+                grouped_indices.append(current_group)
+                current_group = [input_indices[i]]
+        if current_group: grouped_indices.append(current_group)
+        
+        shuffled_indices = []
+        for group in grouped_indices:
+            group_copy = group.copy()
+            if len(group_copy) > 1:
+                random.shuffle(group_copy) # 테스트용이므로 100% 섞음
+            shuffled_indices.extend(group_copy)
+            
+        print(f"👤 Sample User ID: {sample_user}")
+        print(f"{'Orig_Idx':<9} | {'Item_ID':<11} | {'Delta (Days)':<13} | {'Session_ID':<11} | {'Shuffled_Idx':<13}")
+        print("-" * 75)
+        
+        for i in range(len(seq_raw)):
+            orig_idx = i
+            shuff_idx = shuffled_indices[i] # 셔플된 결과가 위치할 인덱스
+            item_id = seq_raw[shuff_idx]
+            delta = time_deltas_raw[shuff_idx]
+            sess_id = session_ids_raw[shuff_idx]
+            
+            # 같은 세션(Session ID)끼리 묶여있는지, Orig_Idx가 섞였는지 확인
+            print(f"{orig_idx:<9} | {item_id:<11} | {delta:<13} | {sess_id:<11} | {shuff_idx:<13}")
+        print("="*75 + "\n")
     def _shuffle_indices_within_session(self, indices, time_deltas_raw):
         if len(indices) <= 1: return indices
         grouped_indices = []
         current_group = [indices[0]]
+        
         for i in range(1, len(indices)):
-            if time_deltas_raw[indices[i]] == 0:
-                current_group.append(indices[i])
+            idx = indices[i]
+            prev_idx = indices[i-1] # 💡 추가
+            
+            # 💡 [핵심 버그 수정] 0인지 묻는 게 아니라, 이전 아이템과 남은 일수(Delta)가 같은지 확인!
+            if time_deltas_raw[idx] == time_deltas_raw[prev_idx]:
+                current_group.append(idx)
             else:
                 grouped_indices.append(current_group)
-                current_group = [indices[i]]
+                current_group = [idx]
+                
         if current_group: grouped_indices.append(current_group)
         
         shuffled_indices = []
@@ -334,6 +368,14 @@ class SASRecDataset_v3(Dataset):
         seq_raw = self.processor.u_seqs[u_mapped_id]
         time_deltas_raw = self.processor.u_deltas[u_mapped_id]
         # 1. 전처리: ID 매핑 및 타임 델타 버킷화
+
+        session_ids_raw = [1]
+        for i in range(1, len(seq_raw)):
+            if time_deltas_raw[i] == time_deltas_raw[i-1]:
+                session_ids_raw.append(session_ids_raw[-1]) # 델타가 같으면 같은 당일(세션)!
+            else:
+                session_ids_raw.append(session_ids_raw[-1] + 1) # 델타가 달라지면 새 세션 시작
+        
         seq_mapped = [self.processor.item2id.get(iid, 0) for iid in seq_raw]
         bins = np.array([0, 3, 7, 14, 30, 60, 180, 330, 395])
         time_buckets = np.digitize(time_deltas_raw, bins, right=False).tolist()
@@ -353,12 +395,14 @@ class SASRecDataset_v3(Dataset):
         # 4. 시퀀스 데이터 추출 (Input, Target, Time Interval)
         input_seq = [seq_mapped[i] for i in shuffled_indices]
         input_time = [time_buckets[i] for i in shuffled_indices]
+        # 💡 [적용] 셔플된 순서에 맞춰 session_id도 재배열 (당일 아이템은 섞여도 같은 번호!)
+        input_session = [session_ids_raw[i] for i in shuffled_indices]
         
         if self.is_train:
-            # i번째 입력의 정답은 항상 i+1번째 아이템 (Shifted Label)
             target_seq = [seq_mapped[i + 1] for i in shuffled_indices]
         else:
             target_seq = []
+            
 
         # 5. 동적 피처 행렬 추출 및 Target_Now 계산
         d_buckets = self.processor.u_dyn_buckets[u_mapped_id][shuffled_indices] # [len, 3]
@@ -366,15 +410,19 @@ class SASRecDataset_v3(Dataset):
         d_cats = self.processor.u_dyn_cats[u_mapped_id][shuffled_indices]       # [len, 1]
         d_time = self.processor.u_dyn_time[u_mapped_id][shuffled_indices]       # [len, 2]
 
+        input_dates = d_time[:, 0].tolist()
+        
         if self.is_train:
-            # 훈련 시: 마지막 정답 아이템의 결제일 기준 (Leakage 방지)
-            last_idx = shuffled_indices[-1] + 1
-            target_now = self.processor.u_dyn_time[u_mapped_id][last_idx][0]
+            target_indices = [idx + 1 for idx in shuffled_indices]
+            step_target_times = self.processor.u_dyn_time[u_mapped_id][target_indices, 0]
+            # 💡 [신규] 바로 다음 타겟(정답)의 실제 주차(Week) 추출
+            step_target_weeks = self.processor.u_dyn_time[u_mapped_id][target_indices, 1] 
+            
+            dynamic_offsets = np.clip(step_target_times - d_time[:, 0], 0, 365).astype(np.int64)
         else:
-            target_now = self.now_ordinal
-
-        # 상대적 거리(Recency Offset) 및 계절성(Week)
-        dynamic_offsets = np.clip(target_now - d_time[:, 0], 0, 365).astype(np.int64)
+            dynamic_offsets = np.clip(self.now_ordinal - d_time[:, 0], 0, 365).astype(np.int64)
+            # 💡 [신규] 추론 시에는 글로벌 타겟 주차(now_week)로 통일하여 예측 방향 강제
+            step_target_weeks = np.array([self.now_week] * len(shuffled_indices))
         current_weeks = d_time[:, 1]
 
         # 6. 패딩 처리 (Left Padding)
@@ -382,14 +430,16 @@ class SASRecDataset_v3(Dataset):
         time_padded = [0] * pad_len + input_time
         target_padded = [0] * pad_len + target_seq if self.is_train else [0] * self.max_len
         padding_mask = [True] * pad_len + [False] * len(input_seq)
-
+        session_padded = [0] * pad_len + input_session
+        target_week_padded = [0] * pad_len + step_target_weeks.tolist()
+        dates_padded = [0] * pad_len + input_dates
         # 7. 아이템 사이드 정보 추출 (Input Padded 기반)
         item_side_info = self.processor.i_side_arr[input_padded]
         type_ids = item_side_info[:, 0]
         color_ids = item_side_info[:, 1]
         graphic_ids = item_side_info[:, 2]
         section_ids = item_side_info[:, 3]
-
+        
         # 8. 동적 피처 패딩 처리
         # 0으로 채워진 패딩 행렬 생성
         pad_b = np.zeros((pad_len, 3), dtype=np.int64)
@@ -415,7 +465,7 @@ class SASRecDataset_v3(Dataset):
             'target_ids': torch.tensor(target_padded, dtype=torch.long),
             'padding_mask': torch.tensor(padding_mask, dtype=torch.bool),
             'time_bucket_ids': torch.tensor(time_padded, dtype=torch.long),
-            
+            'session_ids': torch.tensor(session_padded, dtype=torch.long),
             # 아이템 사이드 정보
             'type_ids': torch.tensor(type_ids, dtype=torch.long),
             'color_ids': torch.tensor(color_ids, dtype=torch.long),
@@ -432,6 +482,7 @@ class SASRecDataset_v3(Dataset):
             # 글로벌 컨텍스트 (시간 거리 및 계절)
             'recency_offset': torch.tensor(offset_p, dtype=torch.long),
             'current_week': torch.tensor(week_p, dtype=torch.long),
+            'target_week': torch.tensor(target_week_padded, dtype=torch.long),
             
             # 정적 유저 피처
             'age_bucket': torch.tensor(s_buckets[0], dtype=torch.long),
@@ -439,6 +490,8 @@ class SASRecDataset_v3(Dataset):
             'news_freq_ids': torch.tensor(s_cats[1], dtype=torch.long),
             'fn_ids': torch.tensor(s_cats[2], dtype=torch.long),
             'active_ids': torch.tensor(s_cats[3], dtype=torch.long),
+
+            'interaction_dates': torch.tensor(dates_padded, dtype=torch.long),
         }
 
 class ContinuousFeatureTokenizer_v3(nn.Module):
@@ -507,7 +560,7 @@ class SASRecUserTower_v3(nn.Module):
         # ------------------------------------------------------------------
         # [게이트 및 기타 모듈 세팅 - 기존 동일]
         # ------------------------------------------------------------------
-        self.seq_gate = nn.Parameter(torch.ones(8-5)) 
+        self.seq_gate = nn.Parameter(torch.ones(9-4)) 
         self.static_gate = nn.Parameter(torch.ones(13-2))
 
         self.emb_ln_item = nn.LayerNorm(self.d_model)
@@ -530,7 +583,7 @@ class SASRecUserTower_v3(nn.Module):
             d_model=self.d_model, nhead=1, dim_feedforward=self.d_model // 2,
             dropout=self.dropout_rate, activation='gelu', norm_first=True, batch_first=True
         )
-        #self.feature_transformer = nn.TransformerEncoder(feat_layer, num_layers=1)
+        self.feature_transformer = nn.TransformerEncoder(feat_layer, num_layers=1)
 
         # ==================================================================
         # 2. Static Embeddings & MLP - 기존과 동일 (생략 없이 원형 유지)
@@ -561,7 +614,7 @@ class SASRecUserTower_v3(nn.Module):
         )
 
         self.output_proj = nn.Sequential(
-            nn.Linear(self.d_model * 2, self.d_model),
+            nn.Linear(self.d_model * 3, self.d_model),
             nn.LayerNorm(self.d_model),
             nn.GELU(),
             nn.Linear(self.d_model, self.d_model)
@@ -599,7 +652,7 @@ class SASRecUserTower_v3(nn.Module):
                 age_bucket, price_bucket, cnt_bucket, recency_bucket,
                 channel_ids, club_status_ids, news_freq_ids, fn_ids, active_ids,
                 cont_feats, 
-                recency_offset, current_week, # 💡 [신규 입력]
+                recency_offset, current_week,target_week=None, # 💡 [신규 입력]
                 padding_mask=None, training_mode=True):
         
         device = item_ids.device
@@ -665,22 +718,22 @@ class SASRecUserTower_v3(nn.Module):
         # -----------------------------------------------------------
         # Phase 2: FDSA - Feature Stream 
         # -----------------------------------------------------------
-        #feat_emb = self.type_emb(type_ids) * s_g[3]
+        feat_emb = self.type_emb(type_ids) * s_g[3]
         #item_emb += self.time_emb(time_bucket_ids) * s_g[1]
         #feat_emb += self.color_emb(color_ids) * s_g[3]
         #feat_emb += self.graphic_emb(graphic_ids) * s_g[4]
         #feat_emb += self.section_emb(section_ids) * s_g[5]
-        #feat_emb += pos_embeddings 
+        feat_emb += pos_embeddings 
         
         # 🔥 Feature Stream에도 계절/시점 주입 (색상, 타입도 계절을 타기 때문)
-        #feat_emb = feat_emb + global_context
+        feat_emb = feat_emb + global_context
         
-        #feat_emb = self.emb_ln_feat(feat_emb)
-        #feat_emb = self.emb_dropout_feat(feat_emb)
+        feat_emb = self.emb_ln_feat(feat_emb)
+        feat_emb = self.emb_dropout_feat(feat_emb)
 
-        #feat_output = self.feature_transformer(
-        #    feat_emb, mask=causal_mask, src_key_padding_mask=padding_mask# 💡 SDPA 엔진에게 Causal 연산임을 직접 알려줌
-        #)
+        feat_output = self.feature_transformer(
+            feat_emb, mask=causal_mask, src_key_padding_mask=padding_mask# 💡 SDPA 엔진에게 Causal 연산임을 직접 알려줌
+        )
 
         # -----------------------------------------------------------
         # Phase 3: Static Encoding (기존 동일)
@@ -710,277 +763,306 @@ class SASRecUserTower_v3(nn.Module):
         ], dim=-1) # 차원이 3D이므로 마지막 차원(dim=-1) 결합
         
         user_profile_vec = self.static_mlp(static_input) # 출력: (Batch, seq_len, d_model)
+        # -----------------------------------------------------------
+        if target_week is not None:
+            # target_week: (Batch, seq_len)
+            t_week_rad = (target_week.float() / 52.0) * (2 * math.pi)
+            t_week_sin = torch.sin(t_week_rad).unsqueeze(-1) 
+            t_week_cos = torch.cos(t_week_rad).unsqueeze(-1) 
+            t_week_cyclical = torch.cat([t_week_sin, t_week_cos], dim=-1) # (Batch, seq_len, 2)
+            
+            # 🔥 핵심: current_week와 동일한 week_proj 가중치를 공유하여 투영!
+            # 동일한 주차면 완전히 동일한 벡터 방향성을 갖게 됩니다.
+            target_week_vec = self.week_proj(t_week_cyclical)* s_g[4] # (Batch, seq_len, d_model)
 
         # -----------------------------------------------------------
         # Phase 5: Late Fusion
         # 💡 변경: user_profile_vec를 확장(expand)할 필요가 없어짐
         # -----------------------------------------------------------
         if training_mode:
-            # 기존 user_profile_expanded 코드 삭제, 그대로 concat
-            final_vec = torch.cat([item_output, user_profile_vec], dim=-1)
+            final_vec = torch.cat([item_output, feat_output , user_profile_vec], dim=-1)
             final_vec = self.output_proj(final_vec)
+            
+            # 💡 [신규] 훈련 시 전체 시퀀스에 타겟 주차(계절감) 방향성 주입
+            if target_week is not None:
+                final_vec = final_vec + target_week_vec
+                
             return F.normalize(final_vec, p=2, dim=-1)
         else:
             item_intent_vec = item_output[:, -1, :] 
-            #feat_intent_vec = feat_output[:, -1, :]
-            # 마지막 스텝의 user_profile 추출
+            feat_intent_vec = feat_output[:, -1, :]
             user_intent_vec = user_profile_vec[:, -1, :]
             
-            final_vec = torch.cat([item_intent_vec, user_intent_vec], dim=-1)
+            final_vec = torch.cat([item_intent_vec, feat_intent_vec ,user_intent_vec], dim=-1)
             final_vec = self.output_proj(final_vec)
+            
+            # 💡 [신규] 추론 시 마지막 스텝의 타겟 주차(계절감) 방향성 주입
+            if target_week is not None:
+                t_week_intent = target_week_vec[:, -1, :] # 마지막 스텝의 타겟 벡터
+                final_vec = final_vec + t_week_intent
+                
             return F.normalize(final_vec, p=2, dim=-1)
         
-def inbatch_corrected_logq_loss_with_hard_neg_margin(
+import json
+import torch
+
+def create_category_mapping_tensor(json_path, processor, device):
+    """
+    JSON에서 product_type_name을 추출하여 아이템 모델 인덱스(1~N)에 매핑되는
+    1D 카테고리 텐서를 생성합니다. (0번 인덱스는 패딩용으로 0값 유지)
+    """
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+        
+    # 💡 수정 1: FeatureProcessor_v3는 1-based index(0은 패딩)를 사용하므로 +1 크기로 생성
+    num_items_total = processor.num_items + 1
+    category_tensor = torch.zeros(num_items_total, dtype=torch.long)
+    
+    # 카테고리 ID도 0을 패딩(Unknown)으로 취급하고 1부터 시작하도록 구성
+    cat_str_to_id = {}
+    
+    for item in data:
+        # 💡 수정 2: processor 내부에서 str 타입으로 인덱싱되어 있으므로 형변환 필수
+        pid = str(item['article_id'])
+        
+        # 💡 수정 3: processor.item_id_map 대신 processor.item2id 사용
+        if pid in processor.item2id:
+            idx = processor.item2id[pid]
+            cat_name = item['product_type_name']
+            
+            if cat_name not in cat_str_to_id:
+                # 카테고리 ID를 1부터 순차적으로 부여
+                cat_str_to_id[cat_name] = len(cat_str_to_id) + 1
+                
+            category_tensor[idx] = cat_str_to_id[cat_name]
+            
+    print(f"📦 Category mapping created. Unique categories: {len(cat_str_to_id)}")
+    return category_tensor.to(device)
+def mine_category_constrained_hard_negatives(item_embs, category_tensor, k=5, device='cuda'):
+    """
+    에포크 시작 시 호출. 동일 카테고리 내에서 Top-K 하드 네거티브를 추출합니다.
+    """
+    num_items = item_embs.size(0)
+    # 초기화: 기본값은 자기 자신(또는 0)으로 채우되, 이후 로직에서 덮어씌움
+    hard_neg_pool = torch.zeros((num_items, k), dtype=torch.long, device=device)
+    
+    unique_cats = torch.unique(category_tensor)
+    
+    for cat in unique_cats:
+        # 1. 해당 카테고리에 속한 아이템 인덱스 추출
+        cat_mask = (category_tensor == cat)
+        cat_indices = torch.nonzero(cat_mask).squeeze(1) # [N_cat]
+        
+        # 카테고리 내 아이템이 너무 적으면 마이닝 생략 (자기 자신 복제)
+        if len(cat_indices) <= 1:
+            hard_neg_pool[cat_indices] = cat_indices.unsqueeze(1).expand(-1, k)
+            continue
+            
+        # 2. 카테고리 내 아이템 임베딩 추출 및 유사도 계산
+        cat_embs = item_embs[cat_indices] # [N_cat, dim]
+        sim_matrix = torch.matmul(cat_embs, cat_embs.T) # [N_cat, N_cat]
+        
+        # 3. 마스킹: 자기 자신 및 너무 똑같은 복제품(유사도 0.99 이상) 제외
+        sim_matrix.fill_diagonal_(-float('inf'))
+        sim_matrix.masked_fill_(sim_matrix >= 0.99, -float('inf'))
+        
+        # 4. Top-K 추출
+        actual_k = min(k, len(cat_indices) - 1)
+        _, topk_idx_local = torch.topk(sim_matrix, actual_k, dim=1)
+        
+        # 5. 로컬 인덱스를 전체 글로벌 아이템 인덱스로 복원
+        topk_idx_global = cat_indices[topk_idx_local]
+        
+        # 만약 카테고리 내 아이템 수가 K개보다 적다면 부족한 만큼 패딩(첫 번째 아이템 복제)
+        if actual_k < k:
+            pad_idx = topk_idx_global[:, [0]].expand(-1, k - actual_k)
+            topk_idx_global = torch.cat([topk_idx_global, pad_idx], dim=1)
+            
+        # 최종 풀에 업데이트
+        hard_neg_pool[cat_indices] = topk_idx_global
+        
+    return hard_neg_pool        
+
+def mine_global_hard_negatives(item_embs, exclusion_top_k=50, mine_k=5, batch_size=2048, device='cuda'):
+    """
+    에포크 시작 시 호출. 카테고리 제약 없이 전체 아이템 풀에서 하드 네거티브를 추출합니다.
+    진짜 정답일 확률이 높은 Top-K(exclusion_top_k)는 배제하고, 그 다음 순위에서 mine_k개를 뽑습니다.
+    
+    Args:
+        item_embs (Tensor): 전체 아이템 임베딩 [num_items, dim]
+        exclusion_top_k (int): 배제할 최상위 유사도 아이템 수 (False Negative 방어용 안전지대)
+        mine_k (int): 최종적으로 추출할 하드 네거티브 개수
+        batch_size (int): GPU OOM 방지를 위한 연산 청크 크기
+    """
+    
+    num_items = item_embs.size(0)
+    hard_neg_pool = torch.zeros((num_items, mine_k), dtype=torch.long, device=device)
+    
+    print(f"🔍 Mining Global Hard Negatives: Skipping Top {exclusion_top_k}, Mining Next {mine_k}...")
+
+    # GPU OOM 방지를 위해 쿼리(Query) 아이템을 배치 단위로 분할하여 처리
+    for i in range(0, num_items, batch_size):
+        end_i = min(i + batch_size, num_items)
+        batch_embs = item_embs[i:end_i] # [Batch, dim]
+        
+        # 1. 글로벌 유사도 계산 (현재 배치 아이템 vs 전체 아이템)
+        sim_matrix = torch.matmul(batch_embs, item_embs.T) # [Batch, num_items]
+        
+        # 2. 마스킹: 너무 똑같은 복제품(유사도 0.99 이상) 제외
+        sim_matrix.masked_fill_(sim_matrix >= 0.99, -float('inf'))
+        
+        # 마스킹: 자기 자신을 확실히 제외 (대각 원소 처리)
+        batch_indices = torch.arange(i, end_i, device=device)
+        sim_matrix[torch.arange(end_i - i, device=device), batch_indices] = -float('inf')
+        
+        # 3. Top-(exclusion_top_k + mine_k) 추출
+        # 예: exclusion_top_k=50, mine_k=5 이면 상위 55개를 뽑음
+        total_k = min(exclusion_top_k + mine_k, num_items - 1)
+        _, topk_indices_global = torch.topk(sim_matrix, total_k, dim=1)
+        
+        # 4. 안전지대(False Negative) 건너뛰고 진짜 하드 네거티브만 슬라이싱
+        # 인덱스 0~49 (Top 50)은 버리고, 50~54 (Next 5)만 가져옴
+        hard_negs = topk_indices_global[:, exclusion_top_k : exclusion_top_k + mine_k]
+        
+        # 예외 처리: 전체 아이템 수가 너무 적어 mine_k개를 못 채운 경우 첫 번째 값으로 패딩
+        if hard_negs.size(1) < mine_k:
+            pad_size = mine_k - hard_negs.size(1)
+            pad_idx = hard_negs[:, [0]].expand(-1, pad_size)
+            hard_negs = torch.cat([hard_negs, pad_idx], dim=1)
+            
+        hard_neg_pool[i:end_i] = hard_negs
+        
+    return hard_neg_pool
+
+
+
+
+def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
     user_emb, item_tower_emb, target_ids, user_ids, log_q_tensor,
-    last_hard_neg_ids=None,  # [B, num_hn]
-    flat_is_last=None,       # [N]
+    batch_hard_neg_ids=None,
+    flat_history_item_ids=None,
+    step_weights=None,
     temperature=0.1, 
-    lambda_logq=1.0,         
-    alpha=1,               
-    margin=0.05,             # 💡 핵심: Positive Margin (정답을 더 꽉 잡게 만듦)
+    lambda_logq=1.0,          
+    alpha=1.0,                
+    margin=0.00,
+    soft_penalty_weight=5.0, # 💡 추가됨: SimANS 스타일의 페널티 강도 조절 (보통 2.0 ~ 10.0 사이 튜닝)
     return_metrics=False     
 ):
     N = user_emb.size(0)
     device = user_emb.device
+    SAFE_NEG_INF = -1e9
     
     # -----------------------------------------------------------
-    # 1. In-batch Logits & Positive Margin 적용
+    # 1. In-batch Logits 계산 (기존과 동일)
     # -----------------------------------------------------------
     batch_item_emb = item_tower_emb[target_ids] 
     sim_matrix = torch.matmul(user_emb, batch_item_emb.T) 
-    
-    # 💡 [핵심] Positive Margin: 정답(대각선)의 코사인 유사도를 강제로 깎아서 모델을 더 노력하게 만듦
-    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
-    sim_matrix[diag_mask] = sim_matrix[diag_mask] - margin
-    
+    pos_sim = torch.diagonal(sim_matrix) # [N]
+    labels = torch.arange(N, device=device)
     logits = sim_matrix / temperature
 
-    # 인기도 보정 (LogQ)
+    if margin > 0.0:
+        logits[labels, labels] -= (margin / temperature)
+
     if lambda_logq > 0.0:
         batch_log_q = log_q_tensor[target_ids]
         logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
 
-    # 마스킹 (동일 아이템, 동일 유저 제외 - 정답 대각선은 살림)
+    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
     same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
     same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
     false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
-    logits.masked_fill_(false_neg_mask, float('-inf'))
-
+    logits = logits.masked_fill(false_neg_mask, SAFE_NEG_INF)
+    
     metrics = {}
     
     # -----------------------------------------------------------
-    # 2. Hard Negative Logits (마지막 스텝 B개만 연산)
+    # 2. Hard Negative Processing (하이브리드 로직 적용)
     # -----------------------------------------------------------
-    if last_hard_neg_ids is not None and flat_is_last is not None:
-        B = last_hard_neg_ids.size(0)
-        num_hn = last_hard_neg_ids.size(1)
+    if batch_hard_neg_ids is not None:
+        num_hn_to_use = 100  # VRAM 상황에 맞춰 20~50 사이로 조절
         
-        # [B, num_hn, dim]
-        hard_neg_emb = item_tower_emb[last_hard_neg_ids] 
+        if batch_hard_neg_ids.size(1) > num_hn_to_use:
+            # 배치 내 동일한 랜덤 인덱스로 뽑거나, 더 정교하게 배치마다 다르게 뽑을 수 있음
+            rand_indices = torch.randperm(batch_hard_neg_ids.size(1), device=device)[:num_hn_to_use]
+            batch_hard_neg_ids = batch_hard_neg_ids[:, rand_indices]
         
-        # 전체 N개의 유저 임베딩 중 마지막 스텝(B개)만 추출: [B, dim]
-        last_user_emb = user_emb[flat_is_last]
         
-        # [B, 1, dim] x [B, dim, num_hn] -> [B, num_hn]
-        hn_sim = torch.bmm(last_user_emb.unsqueeze(1), hard_neg_emb.transpose(1, 2)).squeeze(1)
+        hn_emb = item_tower_emb[batch_hard_neg_ids] 
+        hn_sim = torch.bmm(user_emb.unsqueeze(1), hn_emb.transpose(1, 2)).squeeze(1) 
         
-        # 💡 오답에는 마진을 더하지 않음! 순수 코사인 유사도만 사용
+        # [A] 명확한 False Negative 마스킹 (구매 이력 등)
+        absolute_fn_mask = torch.zeros_like(hn_sim, dtype=torch.bool, device=device)
+        if flat_history_item_ids is not None:
+            absolute_fn_mask = (batch_hard_neg_ids.unsqueeze(2) == flat_history_item_ids.unsqueeze(1)).any(dim=2)
+
+        # [B] 모호한 샘플(Ambiguous Negatives)에 대한 Soft-Weighting 페널티 계산
+        # threshold(0.95 * pos_sim)를 넘는 샘플은 날리지 않고, 초과한 만큼 페널티 부여
+        threshold = 0.95 * pos_sim.unsqueeze(1)
+        
+        # threshold 초과분 계산 (ReLU를 통해 threshold 미만은 0으로 처리)
+        excess_sim = torch.relu(hn_sim - threshold) 
+        
+        # 초과분에 가중치를 곱해 페널티 산출 (온도로 나누어 scale 맞춤)
+        ambiguity_penalty = (excess_sim * soft_penalty_weight) / temperature
+
+        if return_metrics:
+            # 페널티를 받은(0.95를 넘은) 샘플의 비율
+            penalized_mask = excess_sim > 0
+            danger_zone_mask = (hn_sim > 0.80 * pos_sim.unsqueeze(1)) & (hn_sim <= threshold)
+            metrics['hn/danger_zone_ratio'] = danger_zone_mask.float().mean().item()
+            metrics['hn/penalized_ratio'] = penalized_mask.float().mean().item()
+            metrics['sim/hn_all'] = hn_sim.mean().item() 
+            metrics['sim/hn_penalized'] = hn_sim[penalized_mask].mean().item() if penalized_mask.any() else 0.0
+        
         hn_logits = (hn_sim / temperature) * alpha
         
         if lambda_logq > 0.0:
-            hn_log_q = log_q_tensor[last_hard_neg_ids]
+            hn_log_q = log_q_tensor[batch_hard_neg_ids]
             hn_logits = hn_logits - (hn_log_q * lambda_logq)
             
-        invalid_hn_mask = (last_hard_neg_ids == 0)
-        hn_logits.masked_fill_(invalid_hn_mask, float('-inf'))
+        # [C] 페널티 차감 및 절대적 FN 배제
+        # 1. 0.95를 넘는 모호한 샘플들의 Logit을 부드럽게 깎아냄 (Gradient 생존)
+        hn_logits = hn_logits - ambiguity_penalty 
         
-        # 전체 행렬 N 크기에 맞게 채워 넣기 (마지막 스텝이 아닌 로우는 -inf)
-        all_hn_logits = torch.full((N, num_hn), float('-inf'), device=device)
-        all_hn_logits[flat_is_last] = hn_logits
+        # 2. 구매 이력 등 절대적 FN은 확실히 배제
+        hn_logits = hn_logits.masked_fill(absolute_fn_mask, SAFE_NEG_INF)
         
-        # 최종 로짓 병합 [N, N + num_hn]
-        logits = torch.cat([logits, all_hn_logits], dim=1)
-        # Metrics 계산 (선택 사항)
+        logits = torch.cat([logits, hn_logits], dim=1)
+
+    logits = torch.clamp(logits, min=SAFE_NEG_INF, max=1e4)
+
+    # -----------------------------------------------------------
+    # 3. Loss 계산 (가중치 여부 반영)
+    # -----------------------------------------------------------
+    if step_weights is not None:
+        step_weights = torch.as_tensor(step_weights, device=device, dtype=torch.float32)
+        loss_unreduced = F.cross_entropy(logits, labels, reduction='none')
+        loss = (loss_unreduced * step_weights).sum() / (step_weights.sum() + 1e-9)
         if return_metrics:
-            with torch.no_grad():
-                probs = torch.softmax(logits, dim=1)
-                
-                # 1. 모델 붕괴 확인용: 정답을 맞출 확률
-                pos_prob = torch.diag(probs[:, :N]).mean().item()
-                
-                # 💡 2. [핵심] 하드 네거티브의 상대적 Gradient Power 계산
-                # 하드 네거티브가 개입된 '마지막 스텝(B개)' 행만 추출
-                probs_last = probs[flat_is_last] # [B, N + num_hn]
-                
-                # In-batch Negative들의 확률 합 (정답 및 False Negative 제외)
-                # diag_mask와 false_neg_mask도 마지막 스텝 B개에 해당하는 행만 가져옵니다.
-                valid_inbatch_mask = ~(diag_mask[flat_is_last] | false_neg_mask[flat_is_last])
-                inbatch_prob_sum = probs_last[:, :N][valid_inbatch_mask].sum().item() / B
-                
-                # Hard Negative들의 확률 합
-                hn_prob_sum = probs_last[:, N:].sum().item() / B
-                
-                metrics.update({
-                    'sim/pos': (torch.diag(sim_matrix) + margin).mean().item(), # 마진 복구해서 로깅
-                    'sim/hard_neg': hn_sim[~invalid_hn_mask].mean().item(),
-                    'prob/pos': pos_prob,
-                    
-                    # 💡 하드 네거티브가 오답들 사이에서 행사하는 지분 (0.0 ~ 1.0)
-                    'force/hn_power_ratio': hn_prob_sum / (inbatch_prob_sum + hn_prob_sum + 1e-8),
-                    
-                    # 유효하게 0번 패딩이 아닌 하드 네거티브의 비율
-                    'hn_active_ratio': (~invalid_hn_mask).float().mean().item()
-                })
+            metrics['sim/pos'] = ((pos_sim * step_weights).sum() / (step_weights.sum() + 1e-9)).item()
+    else:
+        loss = F.cross_entropy(logits, labels)
+        if return_metrics:
+            metrics['sim/pos'] = pos_sim.mean().item()
 
-    # -----------------------------------------------------------
-    # 3. Final Loss
-    # -----------------------------------------------------------
-    labels = torch.arange(N, device=device)
-    loss = F.cross_entropy(logits, labels)
-    
-    return (loss, metrics) if return_metrics else loss
-
-
-
-import torch
-import torch.nn.functional as F
-
-def inbatch_corrected_logq_loss_with_dynamic_soft_labels(
-    user_emb, item_tower_emb, target_ids, user_ids, log_q_tensor,
-    last_hard_neg_ids=None,
-    flat_is_last=None, 
-    temperature=0.1, 
-    lambda_logq=1.0,         
-    alpha=1,               
-    margin=0.05,             
-    return_metrics=True,
-    K_peers=3, 
-    max_smoothing_mass=0.2,
-    tau_soft=0.1,
-    enable_soft_label=False
-):
-    N = user_emb.size(0)
-    device = user_emb.device
-    metrics = {}
-    
-    # -----------------------------------------------------------
-    # 0. Similarity Matrix 생성
-    # -----------------------------------------------------------
-    batch_item_emb = item_tower_emb[target_ids] 
-    raw_sim = torch.matmul(user_emb, batch_item_emb.T) 
-    
     if return_metrics:
         with torch.no_grad():
-            metrics['sim/pos'] = torch.diag(raw_sim).mean().item()
-            
-    # -----------------------------------------------------------
-    # 1. In-batch Logits & Positive Margin 적용
-    # -----------------------------------------------------------
-    sim_matrix = raw_sim.clone()
-    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
-    sim_matrix[diag_mask] = sim_matrix[diag_mask] - margin
-    
-    logits = sim_matrix / temperature
+            probs = F.softmax(logits, dim=1)
+            if batch_hard_neg_ids is not None:
+                hn_probs_sum = probs[:, N:].sum(dim=1)
+                metrics['hn/influence_ratio'] = hn_probs_sum.mean().item()
+                # 💡 (추가 코드) 순수 Negative들 사이에서 HN이 차지하는 비중 계산
+                # 1.0(전체)에서 정답 확률(probs[:, 0])을 뺀 것이 전체 Negative 파이
+                neg_probs_total = 1.0 - probs.diagonal() 
+                relative_hn_ratio = hn_probs_sum / (neg_probs_total + 1e-9)
+                metrics['hn/relative_influence'] = relative_hn_ratio.mean().item()
+            else:
+                metrics['hn/influence_ratio'] = 0.0
+        return loss, metrics
 
-    if lambda_logq > 0.0:
-        batch_log_q = log_q_tensor[target_ids]
-        logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
-
-    same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
-    same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
-    false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
-    logits.masked_fill_(false_neg_mask, float('-inf'))
-    
-    # -----------------------------------------------------------
-    # 2. 유저 인텐트 유사도 기반 Soft Positive Target 생성
-    # -----------------------------------------------------------
-    user_emb_norm = F.normalize(user_emb, p=2, dim=-1).detach()
-    intent_sim = torch.matmul(user_emb_norm, user_emb_norm.T)
-    
-    invalid_peer_mask = diag_mask | false_neg_mask
-    intent_sim.masked_fill_(invalid_peer_mask, float('-inf'))
-    
-    topk_sim, topk_idx = torch.topk(intent_sim, k=K_peers, dim=1)
-    
-    if return_metrics:
-        with torch.no_grad():
-            peer_item_sims = torch.gather(raw_sim, 1, topk_idx)
-            valid_peer_sims = peer_item_sims[topk_sim > float('-inf')]
-            metrics['sim/soft_pos'] = valid_peer_sims.mean().item() if valid_peer_sims.numel() > 0 else 0.0
-            # 💡 [신규 추가] 유저별 최고 유사도(Top-1 Peer Similarity) 분포 추적
-            # topk_sim[:, 0]은 본인을 제외한 배치 내 가장 유사한 유저와의 코사인 유사도입니다.
-            valid_top1_sims = topk_sim[:, 0]
-            valid_top1_sims = valid_top1_sims[valid_top1_sims > -1e8] # invalid(-inf) 마스킹된 부분 제외
-            
-            if valid_top1_sims.numel() > 0:
-                metrics['sim/peer_top1_mean'] = valid_top1_sims.mean().item()
-                metrics['sim/peer_top1_max'] = valid_top1_sims.max().item()
-                metrics['sim/peer_top1_min'] = valid_top1_sims.min().item()
-                # wandb 히스토그램을 그리기 위해 CPU로 내린 tensor 자체를 전달
-                metrics['sim/peer_top1_raw'] = valid_top1_sims.detach().cpu()
-    peer_weights = torch.zeros_like(topk_sim, dtype=torch.float32) 
-    valid_peer_mask = topk_sim > -1e8 
-    has_valid_peers = valid_peer_mask.any(dim=1)
-    
-    sim_threshold = 0.90  # 코사인 유사도가 이 수치 이상인 경우만 Peer로 인
-    targets = torch.zeros_like(logits, dtype=torch.float32)
-
-    if enable_soft_label and has_valid_peers.any():
-        valid_sims = topk_sim[has_valid_peers].float()
-        
-        relative_weights = F.softmax(valid_sims / tau_soft, dim=1)
-        max_sims = valid_sims.max(dim=1, keepdim=True)[0].clamp(min=0.0)
-        dynamic_mass = max_smoothing_mass * max_sims 
-        
-        calculated_weights = relative_weights * dynamic_mass
-        
-        # 스레숄드 자르기
-        calculated_weights = torch.where(
-            valid_sims > sim_threshold, 
-            calculated_weights, 
-            torch.zeros_like(calculated_weights)
-        )
-        
-        peer_weights[has_valid_peers] = calculated_weights
-        peer_weights = peer_weights * valid_peer_mask.float()
-        targets.scatter_add_(1, topk_idx, peer_weights)
-    
-    
-    
-    
-    
-    
-    
-    sum_soft_pos = targets.sum(dim=1)
-    # 이제 sum_soft_pos는 고정된 0.2가 아니라, 0.0 ~ 0.2 사이를 유동적으로 움직입니다.
-    true_target_probs = (1.0 - sum_soft_pos).clamp(min=0.0, max=1.0) 
-    targets[diag_mask] = true_target_probs
-    
-    # 수치 안정성: 총합 재정규화
-    targets = targets / (targets.sum(dim=1, keepdim=True) + 1e-10)
-    
-    # -----------------------------------------------------------
-    # 3. Final Loss (NaN 철통 방어)
-    # -----------------------------------------------------------
-    logits_float = logits.float()
-    
-    # -inf를 -1e9로 치환하여 CrossEntropy 내부의 log(0) NaN 사태 방지
-    inf_mask = torch.isinf(logits_float)
-    logits_float = torch.where(inf_mask, torch.full_like(logits_float, -1e9), logits_float)
-
-    # 💡 [핵심 수정] 원본 logits.float()가 아니라, 치환이 완료된 logits_float를 넣습니다!
-    loss = F.cross_entropy(logits_float, targets)
-    
-    if return_metrics:
-        metrics['loss/inbatch'] = loss.item()
-        metrics['prob/true_pos'] = true_target_probs.mean().item()
-    
-    return (loss, metrics) if return_metrics else loss
-
-
-
-
-
+    return loss
 # =====================================================================
 # Phase 2: Data Preparation
 # =====================================================================
@@ -989,7 +1071,7 @@ def prepare_features(cfg: PipelineConfig):
     print("\n📊 [Phase 2] Loading Processors...")
     
     # 1. 캐시 파일 경로 설정
-    cache_path = os.path.join(cfg.cache_dir, "processor_cache.pkl")
+    cache_path = os.path.join(cfg.base_dir, "processor_cache.pkl")
     
     # 2. 캐시 존재 여부 확인 및 로드
     if os.path.exists(cache_path):
@@ -1401,29 +1483,30 @@ def evaluate_model(model, item_tower, dataloader, target_df_path, device, proces
             # Dataloader에서 'user_ids'를 문자열 리스트로 바로 가져옴
             user_ids = batch['user_ids'] 
             
-            item_ids = batch['item_ids'].to(device)
-            padding_mask = batch['padding_mask'].to(device)
-            time_bucket_ids = batch['time_bucket_ids'].to(device)
-            type_ids = batch['type_ids'].to(device)
-            color_ids = batch['color_ids'].to(device)
-            graphic_ids = batch['graphic_ids'].to(device)
-            section_ids = batch['section_ids'].to(device)
-            age_bucket = batch['age_bucket'].to(device)
-            price_bucket = batch['price_bucket'].to(device)
-            cnt_bucket = batch['cnt_bucket'].to(device)
-            recency_bucket = batch['recency_bucket'].to(device)
-            channel_ids = batch['channel_ids'].to(device)
-            club_status_ids = batch['club_status_ids'].to(device)
-            news_freq_ids = batch['news_freq_ids'].to(device)
-            fn_ids = batch['fn_ids'].to(device)
-            active_ids = batch['active_ids'].to(device)
-            cont_feats = batch['cont_feats'].to(device)        
-            recency_offset = batch['recency_offset'].to(device)
-            current_week = batch['current_week'].to(device)
-            
+            item_ids = batch['item_ids'].to(device, non_blocking=True)
+            padding_mask = batch['padding_mask'].to(device, non_blocking=True)
+            time_bucket_ids = batch['time_bucket_ids'].to(device, non_blocking=True)
+            session_ids = batch['session_ids'].to(device, non_blocking=True) # 💡 [신규 언패킹]
+            type_ids = batch['type_ids'].to(device, non_blocking=True)
+            color_ids = batch['color_ids'].to(device, non_blocking=True)
+            graphic_ids = batch['graphic_ids'].to(device, non_blocking=True)
+            section_ids = batch['section_ids'].to(device, non_blocking=True)
+            age_bucket = batch['age_bucket'].to(device, non_blocking=True)
+            price_bucket = batch['price_bucket'].to(device, non_blocking=True)
+            cnt_bucket = batch['cnt_bucket'].to(device, non_blocking=True)
+            recency_bucket = batch['recency_bucket'].to(device, non_blocking=True)
+            channel_ids = batch['channel_ids'].to(device, non_blocking=True)
+            club_status_ids = batch['club_status_ids'].to(device, non_blocking=True)
+            news_freq_ids = batch['news_freq_ids'].to(device, non_blocking=True)
+            fn_ids = batch['fn_ids'].to(device, non_blocking=True)
+            active_ids = batch['active_ids'].to(device, non_blocking=True)
+            cont_feats = batch['cont_feats'].to(device, non_blocking=True)        
+            recency_offset = batch['recency_offset'].to(device, non_blocking=True)
+            current_week = batch['current_week'].to(device, non_blocking=True)
+            target_week = batch['target_week'].to(device)
             # Pretrained Vector 룩업 처리
             if 'pretrained_vecs' in batch:
-                pretrained_vecs = batch['pretrained_vecs'].to(device)
+                pretrained_vecs = batch['pretrained_vecs'].to(device, non_blocking=True)
                 print("pretrained_vecs has been loaded")
             else:
                 pretrained_vecs = dataloader.dataset.pretrained_lookup[item_ids.cpu()].to(device)
@@ -1460,7 +1543,7 @@ def evaluate_model(model, item_tower, dataloader, target_df_path, device, proces
                 'fn_ids': fn_ids,
                 'active_ids': active_ids,
                 'cont_feats': cont_feats,
-                'recency_offset': recency_offset, 'current_week': current_week,
+                'recency_offset': recency_offset, 'current_week': current_week, 'target_week': target_week,
                 'padding_mask': padding_mask,
                 'training_mode': False # Dropout 비활성화
             }
@@ -1563,15 +1646,17 @@ def evaluate_model(model, item_tower, dataloader, target_df_path, device, proces
 
 
 
-def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader, optimizer, scaler, cfg, device, hard_neg_pool_tensor, scheduler, seq_labels=None, static_labels=None):
+def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader, optimizer, scaler, cfg, device, hard_neg_pool_tensor, scheduler, hn_scheduler ,seq_labels=None, static_labels=None):
     """단일 에포크 훈련 함수 (All Time Steps + Same-User Masking 적용) + Gradient Accumulation"""
     model.train()
     total_loss_accum = 0.0
     main_loss_accum = 0.0
     cl_loss_accum = 0.0
-    
+    epoch_danger_ratio_sum = 0.0
+    num_batches = 0
     # 💡 [핵심 1] 누적 스텝 설정 (384 * 2 = 768)
     accumulation_steps = 1
+    force_mining_next_epoch = False
     
     seq_labels = seq_labels or []
     static_labels = static_labels or []
@@ -1592,7 +1677,7 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
         target_ids = batch['target_ids'].to(device, non_blocking=True)
         padding_mask = batch['padding_mask'].to(device, non_blocking=True)
         time_bucket_ids = batch['time_bucket_ids'].to(device, non_blocking=True)
-        
+        session_ids = batch['session_ids'].to(device, non_blocking=True)
         type_ids = batch['type_ids'].to(device, non_blocking=True)
         color_ids = batch['color_ids'].to(device, non_blocking=True)
         graphic_ids = batch['graphic_ids'].to(device, non_blocking=True)
@@ -1612,6 +1697,10 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
         
         recency_offset = batch['recency_offset'].to(device, non_blocking=True)
         current_week = batch['current_week'].to(device, non_blocking=True)
+        target_week = batch['target_week'].to(device, non_blocking=True)
+        
+        # 이건 안들어가 모
+        interaction_dates = batch['interaction_dates'].to(device, non_blocking=True)
         
         if 'pretrained_vecs' in batch:
             pretrained_vecs = batch['pretrained_vecs'].to(device, non_blocking=True)
@@ -1629,7 +1718,7 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
             'channel_ids': channel_ids, 'club_status_ids': club_status_ids,
             'news_freq_ids': news_freq_ids, 'fn_ids': fn_ids,
             'active_ids': active_ids, 'cont_feats': cont_feats,
-            'recency_offset': recency_offset, 'current_week': current_week,
+            'recency_offset': recency_offset, 'current_week': current_week, 'target_week': target_week,
             'padding_mask': padding_mask,
             'training_mode': True
         }
@@ -1683,7 +1772,34 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
             
             valid_mask = ~padding_mask 
             batch_size, seq_len = item_ids.shape
+            # ===========================================================
+            # 💡 [Real Time-Decay Weighting] 물리적 시간(Day) 기반 지수 감쇠
+            # ===========================================================
             
+            # 1. 유저별 시퀀스 내의 가장 최근 날짜(Max Date) 구하기
+            # ordinal 날짜는 양수이므로 패딩(0)이 포함되어도 max 취하면 최신 날짜가 나옴
+            max_dates = interaction_dates.masked_fill(padding_mask, -1).max(dim=1, keepdim=True)[0]            
+            # 2. 가장 최근 날짜로부터 각 상호작용 시점까지의 실제 시간 차이 (Days)
+            # Shape: [batch_size, seq_len]
+            delta_t = (max_dates - interaction_dates).float()
+            
+            # 3. 지수 감쇠 (Exponential Decay) 파라미터 설정
+            min_weight = 0.2    # 매우 오래된 클릭이 수렴할 최소 가중치 (20%)
+            half_life = 21.0    # 💡 직관적인 튜닝을 위한 반감기: n일 전 클릭은 중요도가 절반이 됨
+            
+            import math
+            decay_rate = math.log(2) / half_life # lambda 계산
+            
+            # 4. 수식: w = min_weight + (1 - min_weight) * exp(-lambda * delta_t)
+            # delta_t가 0이면(최근 행동, 당일), exp(0)=1 이므로 자동으로 1.0이 부여됨.
+            seq_weights = min_weight + (1.0 - min_weight) * torch.exp(-decay_rate * delta_t)
+            
+            # 5. 유효한 스텝만 평탄화
+            # 패딩 부분의 delta_t는 엄청 커서 min_weight로 수렴하겠지만, valid_mask로 걸러내므로 무시됨
+            flat_weights = seq_weights[valid_mask] 
+            
+            # ===========================================================
+
             seq_positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
             last_indices = torch.max(seq_positions.masked_fill(~valid_mask, -1), dim=1)[0]
             last_indices = last_indices.clamp(min=0) 
@@ -1701,34 +1817,44 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
             
             if flat_output.size(0) > 0:
                 flat_user_emb = F.normalize(flat_output, p=2, dim=1)
-                last_hard_neg_ids = None 
-                
+                flat_history_item_ids = item_ids[flat_user_ids] # Shape: [N, seq_len]
+                # 💡 [신규] 현재 배치의 정답 타겟들에 대한 하드 네거티브 K개를 추출
+                # flat_targets: [N], batch_hard_neg_ids: [N, K]
+                if hard_neg_pool_tensor is not None:
+                    batch_hard_neg_ids = hard_neg_pool_tensor[flat_targets]
+                else:
+                    batch_hard_neg_ids = None
+
                 all_item_emb = item_tower.get_all_embeddings()
                 norm_item_embeddings = F.normalize(all_item_emb, p=2, dim=1)
-                
-                enable_soft_label = (epoch >= 4)
 
-                main_loss, b_metrics = inbatch_corrected_logq_loss_with_dynamic_soft_labels(
+                main_loss, b_metrics = inbatch_corrected_logq_loss_with_hybrid_hard_neg(
                     user_emb=flat_user_emb, item_tower_emb=norm_item_embeddings,
                     target_ids=flat_targets, user_ids=flat_user_ids,
-                    
                     log_q_tensor=log_q_tensor, 
+                    batch_hard_neg_ids=batch_hard_neg_ids, 
+                    flat_history_item_ids=flat_history_item_ids,
+                    step_weights=flat_weights,# 💡 Loss 함수로 전달!
+                    temperature=0.07, lambda_logq=cfg.lambda_logq,   # 💡 [신규] 0.05 마진 부여 (보수적 시작)
+                    alpha=1.0,
+                    soft_penalty_weight=cfg.soft_penalty_weigh,
+                    margin=0.0,
                     
-                    last_hard_neg_ids=last_hard_neg_ids, flat_is_last=flat_is_last, 
-                    
-                    temperature=0.1, lambda_logq=cfg.lambda_logq, margin=0.00, alpha=1, 
-                    
-                    return_metrics=True,
-                    
-                    K_peers=3, 
-                    max_smoothing_mass=0.2,
-                    tau_soft=0.1,
-                    enable_soft_label=enable_soft_label,
+                    return_metrics=True
                 )
+                # 💡 [버그 수정 완료] 들여쓰기를 정상 위치(if 블록 내부)로 복구했습니다!
+                if 'hn/danger_zone_ratio' in b_metrics:
+                    epoch_danger_ratio_sum += b_metrics['hn/danger_zone_ratio']
+                    num_batches += 1
+                    
             else:
                 main_loss = torch.tensor(0.0, device=device)
             
+            
+        
+                
             total_loss = main_loss 
+            
 
             # 💡 [핵심 3] 그래디언트 누적을 위한 Loss 스케일링
             # 두 번 누적할 것이므로, 1번 더해질 때마다 절반의 크기로 더해져야 
@@ -1765,6 +1891,8 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
         total_loss_accum += total_loss.item()
         main_loss_accum += main_loss.item()
         
+        
+        
         pbar.set_postfix({
             'Loss': f"{total_loss.item():.4f}",
             'Main': f"{main_loss.item():.4f}"
@@ -1772,27 +1900,26 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
         
         # 100번 단위 로깅도 미니배치(384) 기준 100번이 됩니다.
         if batch_idx % 100 == 0:
-            wandb_log_dict = { 
-                              "Train/Main_Loss": main_loss.item()
-                              }
-            if 'sim/pos' in b_metrics:
-                wandb_log_dict["Train/Sim_Pos"] = b_metrics['sim/pos']
-            if 'sim/soft_pos' in b_metrics:
-                wandb_log_dict["Train/Sim_Soft_Pos"] = b_metrics['sim/soft_pos']
-            if 'prob/true_pos' in b_metrics:
-                wandb_log_dict["Train/Prob_True_Pos"] = b_metrics['prob/true_pos']
-            # 💡 [신규 추가] Peer 유사도 통계 및 히스토그램 로깅
+            wandb_log_dict = {"Train/Main_Loss": main_loss.item()}
+            for k in ['sim/pos', 'hn/survived_ratio', 'sim/hn_all', 'sim/hn', 'hn/influence_ratio', 
+                      'sim/soft_pos', 'prob/true_pos', 'hn/penalized_ratio', 'sim/hn_penalized', 
+                      'hn/relative_influence', 'hn/danger_zone_ratio']:
+                if k in b_metrics:
+                    log_key = k if '/' in k else f"Train/{k}"
+                    if k == 'sim/hn': log_key = "Train/sim:hn_candidate_mean"
+                    if k == 'sim/hn_all': log_key = "Train/sim:hn_all_mean"
+                    wandb_log_dict[log_key] = b_metrics[k]
+
             if 'sim/peer_top1_mean' in b_metrics:
-                wandb_log_dict["Peer_Sim/Top1_Mean"] = b_metrics['sim/peer_top1_mean']
-                wandb_log_dict["Peer_Sim/Top1_Max"] = b_metrics['sim/peer_top1_max']
-                wandb_log_dict["Peer_Sim/Top1_Min"] = b_metrics['sim/peer_top1_min']
-            
-            # wandb.Histogram을 사용하면 에포크/스텝 진행에 따른 유사도 분포의 변화를 시각적으로 볼 수 있습니다.
+                wandb_log_dict.update({
+                    "Peer_Sim/Top1_Mean": b_metrics['sim/peer_top1_mean'],
+                    "Peer_Sim/Top1_Max": b_metrics['sim/peer_top1_max'],
+                    "Peer_Sim/Top1_Min": b_metrics['sim/peer_top1_min']
+                })
             if 'sim/peer_top1_raw' in b_metrics:
                 wandb_log_dict["Peer_Sim/Top1_Distribution"] = wandb.Histogram(b_metrics['sim/peer_top1_raw'].numpy())
 
             wandb.log(wandb_log_dict)
-            
         # mini-batch deloc
         del output_1, flat_output, flat_targets, flat_is_last, flat_user_ids
         del main_loss, total_loss, scaled_loss
@@ -1802,7 +1929,7 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
         del type_ids, color_ids, graphic_ids, section_ids
         del age_bucket, price_bucket, cnt_bucket, recency_bucket
         del channel_ids, club_status_ids, news_freq_ids, fn_ids, active_ids, cont_feats
-        del recency_offset, current_week
+        del recency_offset, current_week,interaction_dates
         if 'flat_user_emb' in locals():
             del flat_user_emb, all_item_emb, norm_item_embeddings
         
@@ -1810,6 +1937,22 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
     avg_loss = total_loss_accum / len(dataloader)
     avg_main = main_loss_accum / len(dataloader)
     avg_cl = cl_loss_accum / len(dataloader) if cl_loss_accum > 0 else 0.0
+
+
+
+    avg_danger_ratio = epoch_danger_ratio_sum / num_batches if num_batches > 0 else 0.0
+    print(f"📊 Epoch [{epoch}] Avg Danger Zone Ratio: {avg_danger_ratio:.4f}")
+
+    # 4. 💡 [핵심] 스케줄러에 통보하여 EX-TOP-K 동적 조절
+    if hn_scheduler is not None:
+        updated, new_ex_top_k, moving_avg = hn_scheduler.step(avg_danger_ratio)
+        
+        if updated:
+            print(f" [Scheduler Alert] 3-Epoch Moving Avg Danger Ratio ({moving_avg:.4f}) exceeded 0.04!")
+            print(f"📈 EX-TOP-K Expanded: {cfg.EX_TOP_K} -> {new_ex_top_k}")
+            cfg.EX_TOP_K = new_ex_top_k
+            force_mining_next_epoch = True # 바깥 루프에 채굴 명령 하달
+
 
     # Gate Weights Logging
     with torch.no_grad():
@@ -1826,31 +1969,38 @@ def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader
             wandb.log(gate_log)
 
     print(f"🏁 Epoch {epoch} Completed | Avg Total: {avg_loss:.4f} (Main: {avg_main:.4f}, CL: {avg_cl:.4f})")
-    return avg_loss
+    return avg_loss, force_mining_next_epoch
 
-def run_pipeline_opt_v2():
-    """Airflow DAG나 MLflow Run에서 직접 호출하는 엔트리 포인트"""
-    print("🚀 Starting User Tower Training Pipeline...")
+
+def resume_pipeline_session_weights():
+    """
+    Epoch 11까지 학습된 베이스라인 모델을 불러와서,
+    Session-aware 가중치와 HNM을 결합하여 재학습(Resume)하는 엔트리 포인트
+    """
+    print("🚀 Starting User Tower Resume Pipeline (Session Weights & HNM)...")
     
-    SEQ_LABELS = ['item_id', #'time',
-                  #'type', #'color', 'graphic', 'section', 
-                  'recency_curr', 'week_curr']
+    
+    SEQ_LABELS = ['item_id', 'recency_curr', 'week_curr', 'item_type', 'target_week']
     STATIC_LABELS = [
-        'age', 'price', #'cnt', 'recency',      # Buckets (4)
-        'channel', 'club', 'news', 'fn', 'active', # Categoricals (5)
-        'cont_price_std', 'cont_last_diff', 'cont_repurch', 'cont_weekend' # Continuous (4) [추가]
+        'age', 'price',
+        'channel', 'club', 'news', 'fn', 'active',
+        'cont_price_std', 'cont_last_diff', 'cont_repurch', 'cont_weekend'
     ] 
     
     # 1. Config & Env
     cfg = PipelineConfig()
     device = setup_environment()
-    processor, val_processor, cfg = prepare_features(cfg)
+    processor , val_processor, cfg = prepare_features(cfg)
     
-    # 1-1. h-params 세팅 (Epoch 대폭 상향)
-    cfg.lr = 2e-3
-    cfg.epochs = 50  # 💡 [핵심] 충분한 탐색을 위해 에포크를 50으로 상향 (실제론 Early Stop 됨)
+    # -----------------------------------------------------------
+    # 💡 하드 네거티브 및 하이퍼파라미터 세팅
+    # -----------------------------------------------------------
+    cfg.lr = 1.2e-3               # 기존 학습률 유지
+    cfg.epochs = 16            # 이미 11에포크를 돌았으므로, 추가로 30에포크면 충분
+    cfg.HN_K = 200  # 20개 추출 후 내부 0.95 제약으로 필터링
+    cfg.EX_TOP_K = 100
+    cfg.soft_penalty_weigh = 3
     
-    # item metadata cfg
     HASH_SIZE = 1000
     cfg.num_prod_types = HASH_SIZE
     cfg.num_colors = HASH_SIZE
@@ -1858,10 +2008,8 @@ def run_pipeline_opt_v2():
     cfg.num_sections = HASH_SIZE
     TARGET_VAL_PATH = os.path.join(cfg.base_dir, "features_target_val.parquet")
 
-    # 2. Data 가져오기
-    aligned_vecs = load_aligned_pretrained_embeddings(processor, cfg.base_dir, cfg.pretrained_dim)
-    
-    item_state_dict = load_item_tower_state_dict(cfg.base_dir, cfg.item_tower_pth_name, device)
+    # 2. Data & Metadata 가져오기
+    aligned_vecs = load_aligned_pretrained_embeddings(processor, cfg.model_dir, cfg.pretrained_dim)
     log_q_tensor = processor.get_logq_probs(device)
     
     item_metadata_tensor = load_item_metadata_hashed(processor, cfg.base_dir, hash_size=HASH_SIZE)
@@ -1870,59 +2018,103 @@ def run_pipeline_opt_v2():
     
     train_loader = create_dataloaders(processor, cfg, "2020-09-16", aligned_vecs, is_train=True)
     val_loader = create_dataloaders(val_processor, cfg, "2020-09-22", aligned_vecs, is_train=False)
-    dataset_peek_v3(train_loader.dataset, processor)
     
-    print(f"✅ Final Model Config - Total Hash Nodes: {cfg.num_prod_types + cfg.num_colors + cfg.num_graphics + cfg.num_sections}")
-
+    #json_path = os.path.join(cfg.base_dir, "filtered_data_reinforced.json")
+    #item_category_ids = create_category_mapping_tensor(json_path, processor, device)
+    
     wandb.init(
         project="SASRec-User-Tower-causality-Optimization-v2",
-        name=f"run_lr_{cfg.lr}_epoch_{cfg.epochs}_shuffle_session_correction", 
+        name=f"Resume_SessionWeight_lr{cfg.lr}_K{cfg.HN_K}", 
         config=cfg.__dict__ 
     )
     
     # -----------------------------------------------------------
-    # 3. Models & Optimizer Setup (초기 상태: Epoch 1용 세팅)
+    # 3. Models Setup & 💡 Epoch 11 베이스라인 가중치 로드
     # -----------------------------------------------------------
-    user_tower, item_tower = setup_models(cfg, device, item_state_dict, log_q_tensor)
-    item_tower.init_from_pretrained(aligned_vecs.to(device))
-    item_tower.set_freeze_state(True)
-    print(f"❄️ Epoch 1: Item Tower FROZEN! (User Tower LR: {cfg.lr})")
-    optimizer = torch.optim.AdamW(
-        user_tower.parameters(), 
-        lr=cfg.lr, 
-        weight_decay=cfg.weight_decay,
-        fused=True  # 💡 다중 CUDA 커널을 하나로 융합하여 속도 극대화
-    )
+    user_tower, item_tower = setup_models(cfg, device, None, log_q_tensor) 
+    
+    # 💡 [요청 사항 1] 모델 경로 지정 및 로드
+    base_user_pth = os.path.join(cfg.model_dir, "best_user_tower_adapt_sch.pth")
+    base_item_pth = os.path.join(cfg.model_dir, "best_item_tower_adapt_sch.pth")
+    
+    print(f"📥 Loading Baseline Models from Epoch 11...")
+    user_tower.load_state_dict(torch.load(base_user_pth, map_location=device))
+    item_tower.load_state_dict(torch.load(base_item_pth, map_location=device))
+    print(f"✅ Baseline Models loaded successfully.")
+
+    # 💡 [요청 사항 2] 처음부터 Item Tower 해동 (Unfreeze) 및 비대칭 LR 적용
+    print("🔥 Epoch 12 (Resume): Item Tower is UNFROZEN from the start!")
+    item_tower.set_freeze_state(False)
+    item_finetune_lr = cfg.lr * 0.05 
+    
+    # Optimizer에 두 타워를 동시에 등록 (LR 비대칭)
+    optimizer = torch.optim.AdamW([
+        {'params': user_tower.parameters(), 'lr': cfg.lr},
+        {'params': item_tower.parameters(), 'lr': item_finetune_lr}
+    ], weight_decay=cfg.weight_decay, fused=True)
+    
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
     
-    # 💡 [신규 스케줄러 & 얼리스탑 세팅] 
     total_steps = len(train_loader) * cfg.epochs
-    warmup_steps = int(total_steps * 0.05) # 전체 훈련의 5% 구간 웜업 (50 에포크 기준)
+    warmup_steps = int(total_steps * 0.05) 
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01) 
     
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01)
-    
-    # Patience 7 부여 (7 에포크 동안 안 오르면 종료)
-    early_stopping = EarlyStopping(patience=5, mode='max')
+    early_stopping = EarlyStopping(patience=7, mode='max')
 
+    hn_scheduler = None
+    '''
+    hn_scheduler = AdaptiveHNScheduler(
+        initial_ex_top_k=cfg.EX_TOP_K, 
+        threshold=0.04,     # 4%
+        window_size=3,      # 3에폭 이동평균
+        step_size=25,       # 한 번에 25씩 확장
+        max_ex_top_k=150    # 아무리 밀려도 150 이상은 안 넘어가게 (심해 방지)
+    )
+    ''' 
+    force_mining_next_epoch = False
     # -----------------------------------------------------------
-    # 4. Training Loop
+    # 4. Training Loop (💡 자연스러운 출력을 위해 에포크 10부터 시작)
     # -----------------------------------------------------------
-    for epoch in range(1, cfg.epochs + 1):
-        # 💡 [Dynamic Unfreeze 시점 변경] 에포크가 늘어났으므로 5 에포크에 파인튜닝 시작
-        if epoch == 5: 
-            print("\n🔥 [Dynamic Unfreeze] Epoch 4: Item Tower Joint Training 시작!")
-            item_tower.set_freeze_state(False)
-            item_finetune_lr = cfg.lr * 0.05 
+    start_epoch = 24
+    end_epoch = start_epoch + cfg.epochs
+    
+    epoch_hn_pool = None
+    for epoch in range(start_epoch, end_epoch):
+        
+        # 💡 [핵심 변경] 기존의 2에폭 주기 정기 마이닝 '또는(or)' 스케줄러의 긴급 마이닝 명령
+        if ((epoch - 10) % 2 == 0) or force_mining_next_epoch:
             
-            optimizer.add_param_group({
-                'params': item_tower.parameters(), 
-                'lr': item_finetune_lr 
-            })
-            print(f"   - User Tower LR: {cfg.lr}")
-            print(f"   - Item Tower LR: {item_finetune_lr} (Fine-tuning mode)")
+            # 로그 분기: 정기 마이닝인지, 스케줄러에 의한 강제 마이닝인지 구분
+            if force_mining_next_epoch:
+                print(f"\n🚨 [Adaptive Mining Triggered] Re-mining with Expanded EX-TOP-K={cfg.EX_TOP_K}")
+            else:
+                print(f"\n🔍 [Epoch {epoch} Start] Mining Category-Constrained Hard Negatives (K={cfg.HN_K})...")
+            
+            item_tower.eval() 
+            with torch.no_grad():
+                all_item_embs = item_tower.get_all_embeddings()
+                norm_item_embs = F.normalize(all_item_embs, p=2, dim=1)
+                
+                # cfg.EX_TOP_K가 스케줄러에 의해 넓어졌다면 바로 반영됨
+                epoch_hn_pool = mine_global_hard_negatives(
+                    norm_item_embs, exclusion_top_k=cfg.EX_TOP_K, mine_k=cfg.HN_K, batch_size=2048, device=device
+                )
+                
+                del all_item_embs, norm_item_embs
+                torch.cuda.empty_cache()
+                
+            item_tower.train()
+            
+            # 💡 [추가] 마이닝을 수행했으므로 플래그 초기화 (안 그러면 매 에폭 마이닝합니다!)
+            force_mining_next_epoch = False
 
+        else: 
+            print(f"\n♻️ [Epoch {epoch} Start] Using Cached Hard Negative Pool (No Mining Overheads)")
+        
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch [{epoch}]  - Current LR: {current_lr:.8f}")
         # ------------------- 훈련 (Train) -------------------
-        avg_loss = train_user_tower_all_time(
+        avg_loss, force_mining_next_epoch  = train_user_tower_all_time(
             epoch=epoch,
             model=user_tower,
             item_tower=item_tower, 
@@ -1932,18 +2124,18 @@ def run_pipeline_opt_v2():
             scaler=scaler,
             cfg=cfg,
             device=device,
-            hard_neg_pool_tensor=None,
-            scheduler=scheduler, # 배치 단위 스텝을 위해 전달
-            seq_labels = SEQ_LABELS,
-            static_labels = STATIC_LABELS,
+            hard_neg_pool_tensor=epoch_hn_pool, # 💡 방금 뽑은 최신 HN 풀 전달
+            scheduler=scheduler, 
+            hn_scheduler=hn_scheduler,
+            seq_labels=SEQ_LABELS,
+            static_labels=STATIC_LABELS,
         )
-        print()
-        import gc
-        gc.collect()
+
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
         
         # ------------------- 평가 (Evaluate) -------------------
+        
         val_metrics = evaluate_model(
             model=user_tower, 
             item_tower=item_tower, 
@@ -1954,32 +2146,35 @@ def run_pipeline_opt_v2():
             k_list=[10, 20, 100, 500]
         )
         
-        current_recall_100 = val_metrics.get('Recall@100', 0.0)
+        current_recall_20 = val_metrics.get('Recall@20', 0.0)
         
         # ------------------- 스케줄러 & Best Model 저장 -------------------
-        early_stopping(current_recall_100)
+        early_stopping(current_recall_20)
         
         if early_stopping.is_best:
-            print(f"🌟 [New Best!] Recall@100 updated: {current_recall_100:.2f}%")
+            print(f"🌟 [New Best!] Recall@20 updated: {current_recall_20:.2f}%")
             
-            # 최고 성능 달성 시 파라미터 덮어쓰기 저장
-            torch.save(user_tower.state_dict(), os.path.join(cfg.model_dir, "best_user_tower_v3_allseq_session_v2_test.pth"))
-            torch.save(item_tower.state_dict(), os.path.join(cfg.model_dir, "best_item_tower_v3_allseq_session_v2.test_pth"))
-            print("   💾 Best model weights saved to disk.")
+            # 💡 [요청 사항 3] 저장 이름 변경 (session_weights 명시)
+            save_user_pth = os.path.join(cfg.model_dir, "best_user_tower_adapt_sch_w.pth")
+            save_item_pth = os.path.join(cfg.model_dir, "best_item_tower_adapt_sch_w.pth")
+            
+            torch.save(user_tower.state_dict(), save_user_pth)
+            torch.save(item_tower.state_dict(), save_item_pth)
+            print(f"   💾 Best model weights saved to: {save_user_pth}")
             
         if early_stopping.early_stop:
-            print(f"\n🛑 조기 종료 발동! {early_stopping.patience} Epoch 동안 Recall@100이 개선되지 않았습니다.")
-            print(f"🏆 최종 최고 Recall@100: {early_stopping.best_score:.2f}%")
+            print(f"\n🛑 조기 종료 발동! {early_stopping.patience} Epoch 동안 Recall@20이 개선되지 않았습니다.")
+            print(f"🏆 최종 최고 Recall@20: {early_stopping.best_score:.2f}%")
             break
-        
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
             
-    print("\n🎉 Pipeline Execution Finished Successfully!")
-
+    print("\n🎉 Resume Pipeline Execution Finished Successfully!")
+    
+    
+    
+    
 if __name__ == "__main__":
     # 5에포크까지 학습했으므로 6번부터 재개
     #run_resume_pipeline(resume_epoch=16, last_best_recall=22.60)
-    run_pipeline_opt_v2()
+    #run_pipeline_opt_v2()
+    resume_pipeline_session_weights()
     #run_resume_pipeline_v2()

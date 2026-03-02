@@ -11,7 +11,7 @@ class PipelineConfig:
     ft_model_dir: str = r"C:\Users\candyform\Desktop\inferenceCode\models\finetune"
 
     # Hyperparameters
-    batch_size: int = 768
+    batch_size: int = 512
     lr: float = 5e-4
     weight_decay: float = 1e-4
     epochs: int = 15
@@ -46,3 +46,7 @@ class PipelineConfig:
     num_age_groups: int = 10
 
     max_target_len: int = 10
+    
+    HN_K = 100  # 20개 추출 후 내부 0.95 제약으로 필터링
+    EX_TOP_K = 25
+    soft_penalty_weigh = 3

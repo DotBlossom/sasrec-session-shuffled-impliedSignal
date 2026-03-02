@@ -253,7 +253,6 @@ def make_user_features_v3(train_df, target_val_path, USER_META_PATH, USER_FEAT_V
     del daily_agg, customers_df, user_seq_df; gc.collect()
     return final_df
 
-
 class FeatureProcessor_v3:
     def __init__(self, user_path, item_path, base_processor=None):
         print("🚀 Loading preprocessed features...")
@@ -276,6 +275,7 @@ class FeatureProcessor_v3:
         # =================================================================
         self.user_ids = self.seqs.index.tolist() # 시퀀스가 존재하는 유저만 대상
         self.user2id = {uid: i + 1 for i, uid in enumerate(self.users.index)}
+        self.num_users = len(self.user_ids)
         
         
         
@@ -443,3 +443,4 @@ def monitor_processor_storage(processor):
         # 3. 값의 범위 체크 (Scaling/Bucketing 확인)
         print(f" -> Conts Mean (Scaled): {dyn_c.mean():.4f} (Expect: Near 0 if well scaled)")
         print(f" -> Buckets Max: {dyn_b.max()} (Expect: <= 10 or 11)")
+

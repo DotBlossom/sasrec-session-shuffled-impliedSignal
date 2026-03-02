@@ -17,7 +17,7 @@ if root_path not in sys.path:
     sys.path.append(root_path)
 
 from preprocessor.preprocessor_v2 import FeatureProcessor_v3, dataset_peek_v3
-from v3_model_usertower import SASRecDataset_v3,SASRecUserTower_v3
+from  tower_code.v3_model_usertower import SASRecDataset_v3,SASRecUserTower_v3
 
 
 def setup_environment(seed: int = 42):
