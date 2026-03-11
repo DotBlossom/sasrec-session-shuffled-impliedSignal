@@ -301,3 +301,131 @@ def setup_models(cfg: PipelineConfig, device, item_state_dict=None, log_q_tensor
     return user_tower, item_tower
 
 
+
+def create_category_mapping_tensor(json_path, processor, device):
+    """
+    JSON에서 product_type_name을 추출하여 아이템 모델 인덱스(1~N)에 매핑되는
+    1D 카테고리 텐서를 생성합니다. (0번 인덱스는 패딩용으로 0값 유지)
+    """
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+        
+    # 💡 수정 1: FeatureProcessor_v3는 1-based index(0은 패딩)를 사용하므로 +1 크기로 생성
+    num_items_total = processor.num_items + 1
+    category_tensor = torch.zeros(num_items_total, dtype=torch.long)
+    
+    # 카테고리 ID도 0을 패딩(Unknown)으로 취급하고 1부터 시작하도록 구성
+    cat_str_to_id = {}
+    
+    for item in data:
+        # 💡 수정 2: processor 내부에서 str 타입으로 인덱싱되어 있으므로 형변환 필수
+        pid = str(item['article_id'])
+        
+        # 💡 수정 3: processor.item_id_map 대신 processor.item2id 사용
+        if pid in processor.item2id:
+            idx = processor.item2id[pid]
+            cat_name = item['product_type_name']
+            
+            if cat_name not in cat_str_to_id:
+                # 카테고리 ID를 1부터 순차적으로 부여
+                cat_str_to_id[cat_name] = len(cat_str_to_id) + 1
+                
+            category_tensor[idx] = cat_str_to_id[cat_name]
+            
+    print(f"📦 Category mapping created. Unique categories: {len(cat_str_to_id)}")
+    return category_tensor.to(device)
+def mine_category_constrained_hard_negatives(item_embs, category_tensor, k=5, device='cuda'):
+    """
+    에포크 시작 시 호출. 동일 카테고리 내에서 Top-K 하드 네거티브를 추출합니다.
+    """
+    num_items = item_embs.size(0)
+    # 초기화: 기본값은 자기 자신(또는 0)으로 채우되, 이후 로직에서 덮어씌움
+    hard_neg_pool = torch.zeros((num_items, k), dtype=torch.long, device=device)
+    
+    unique_cats = torch.unique(category_tensor)
+    
+    for cat in unique_cats:
+        # 1. 해당 카테고리에 속한 아이템 인덱스 추출
+        cat_mask = (category_tensor == cat)
+        cat_indices = torch.nonzero(cat_mask).squeeze(1) # [N_cat]
+        
+        # 카테고리 내 아이템이 너무 적으면 마이닝 생략 (자기 자신 복제)
+        if len(cat_indices) <= 1:
+            hard_neg_pool[cat_indices] = cat_indices.unsqueeze(1).expand(-1, k)
+            continue
+            
+        # 2. 카테고리 내 아이템 임베딩 추출 및 유사도 계산
+        cat_embs = item_embs[cat_indices] # [N_cat, dim]
+        sim_matrix = torch.matmul(cat_embs, cat_embs.T) # [N_cat, N_cat]
+        
+        # 3. 마스킹: 자기 자신 및 너무 똑같은 복제품(유사도 0.99 이상) 제외
+        sim_matrix.fill_diagonal_(-float('inf'))
+        sim_matrix.masked_fill_(sim_matrix >= 0.99, -float('inf'))
+        
+        # 4. Top-K 추출
+        actual_k = min(k, len(cat_indices) - 1)
+        _, topk_idx_local = torch.topk(sim_matrix, actual_k, dim=1)
+        
+        # 5. 로컬 인덱스를 전체 글로벌 아이템 인덱스로 복원
+        topk_idx_global = cat_indices[topk_idx_local]
+        
+        # 만약 카테고리 내 아이템 수가 K개보다 적다면 부족한 만큼 패딩(첫 번째 아이템 복제)
+        if actual_k < k:
+            pad_idx = topk_idx_global[:, [0]].expand(-1, k - actual_k)
+            topk_idx_global = torch.cat([topk_idx_global, pad_idx], dim=1)
+            
+        # 최종 풀에 업데이트
+        hard_neg_pool[cat_indices] = topk_idx_global
+        
+    return hard_neg_pool        
+
+def mine_global_hard_negatives(item_embs, exclusion_top_k=50, mine_k=5, batch_size=2048, device='cuda'):
+    """
+    에포크 시작 시 호출. 카테고리 제약 없이 전체 아이템 풀에서 하드 네거티브를 추출합니다.
+    진짜 정답일 확률이 높은 Top-K(exclusion_top_k)는 배제하고, 그 다음 순위에서 mine_k개를 뽑습니다.
+    
+    Args:
+        item_embs (Tensor): 전체 아이템 임베딩 [num_items, dim]
+        exclusion_top_k (int): 배제할 최상위 유사도 아이템 수 (False Negative 방어용 안전지대)
+        mine_k (int): 최종적으로 추출할 하드 네거티브 개수
+        batch_size (int): GPU OOM 방지를 위한 연산 청크 크기
+    """
+    
+    num_items = item_embs.size(0)
+    hard_neg_pool = torch.zeros((num_items, mine_k), dtype=torch.long, device=device)
+    
+    print(f"🔍 Mining Global Hard Negatives: Skipping Top {exclusion_top_k}, Mining Next {mine_k}...")
+
+    # GPU OOM 방지를 위해 쿼리(Query) 아이템을 배치 단위로 분할하여 처리
+    for i in range(0, num_items, batch_size):
+        end_i = min(i + batch_size, num_items)
+        batch_embs = item_embs[i:end_i] # [Batch, dim]
+        
+        # 1. 글로벌 유사도 계산 (현재 배치 아이템 vs 전체 아이템)
+        sim_matrix = torch.matmul(batch_embs, item_embs.T) # [Batch, num_items]
+        
+        # 2. 마스킹: 너무 똑같은 복제품(유사도 0.99 이상) 제외
+        sim_matrix.masked_fill_(sim_matrix >= 0.99, -float('inf'))
+        
+        # 마스킹: 자기 자신을 확실히 제외 (대각 원소 처리)
+        batch_indices = torch.arange(i, end_i, device=device)
+        sim_matrix[torch.arange(end_i - i, device=device), batch_indices] = -float('inf')
+        
+        # 3. Top-(exclusion_top_k + mine_k) 추출
+        # 예: exclusion_top_k=50, mine_k=5 이면 상위 55개를 뽑음
+        total_k = min(exclusion_top_k + mine_k, num_items - 1)
+        _, topk_indices_global = torch.topk(sim_matrix, total_k, dim=1)
+        
+        # 4. 안전지대(False Negative) 건너뛰고 진짜 하드 네거티브만 슬라이싱
+        # 인덱스 0~49 (Top 50)은 버리고, 50~54 (Next 5)만 가져옴
+        hard_negs = topk_indices_global[:, exclusion_top_k : exclusion_top_k + mine_k]
+        
+        # 예외 처리: 전체 아이템 수가 너무 적어 mine_k개를 못 채운 경우 첫 번째 값으로 패딩
+        if hard_negs.size(1) < mine_k:
+            pad_size = mine_k - hard_negs.size(1)
+            pad_idx = hard_negs[:, [0]].expand(-1, pad_size)
+            hard_negs = torch.cat([hard_negs, pad_idx], dim=1)
+            
+        hard_neg_pool[i:end_i] = hard_negs
+        
+    return hard_neg_pool

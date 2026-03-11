@@ -21,7 +21,7 @@ class PipelineConfig:
     max_len: int = 50
     dropout: float = 0.3
     pretrained_dim: int = 128 # 사전학습 아이템 벡터 차원 
-    nhead: int = 4
+    nhead: int = 2
     num_layers: int = 2
     
     # Loss Penalties
@@ -50,3 +50,4 @@ class PipelineConfig:
     HN_K = 100  # 20개 추출 후 내부 0.95 제약으로 필터링
     EX_TOP_K = 25
     soft_penalty_weigh = 3
+    hn_scheduled = False

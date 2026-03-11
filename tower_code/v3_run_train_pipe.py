@@ -12,188 +12,13 @@ if root_path not in sys.path:
     
 from gnn_model.v1_evaluate_lightgcl import lightgcl_importer
 from params_config import PipelineConfig
-from sheduler import EarlyStopping, get_cosine_schedule_with_warmup
+from sheduler import BidirectionalHNScheduler, EarlyStopping, get_cosine_schedule_with_warmup
 from v3_lightgcl_util import load_aligned_lightgcl_user_embeddings
 from v3_model_usertower import create_category_mapping_tensor, mine_category_constrained_hard_negatives
 from v3_train_usertower import evaluate_model, train_user_tower_all_time, train_user_tower_all_time_gcl_dil, verify_id_alignment
 from v3_utils import create_dataloaders, load_aligned_pretrained_embeddings, load_item_metadata_hashed, prepare_features, setup_environment, setup_models
 import torch.nn.functional as F
 
-def resume_pipeline_session_weights():
-    """
-    Epoch 11까지 학습된 베이스라인 모델을 불러와서,
-    Session-aware 가중치와 HNM을 결합하여 재학습(Resume)하는 엔트리 포인트
-    """
-    print("🚀 Starting User Tower Resume Pipeline (Session Weights & HNM)...")
-    
-    
-    SEQ_LABELS = ['item_id', 'recency_curr', 'week_curr', 'item_type', 'target_week']
-    STATIC_LABELS = [
-        'age', 'price',
-        'channel', 'club', 'news', 'fn', 'active',
-        'cont_price_std', 'cont_last_diff', 'cont_repurch', 'cont_weekend'
-    ] 
-    
-    # 1. Config & Env
-    cfg = PipelineConfig()
-    device = setup_environment()
-    processor, val_processor, cfg = prepare_features(cfg)
-    
-    # -----------------------------------------------------------
-    # 💡 하드 네거티브 및 하이퍼파라미터 세팅
-    # -----------------------------------------------------------
-    cfg.lr = 1.8e-3               # 기존 학습률 유지
-    cfg.epochs = 24             # 이미 11에포크를 돌았으므로, 추가로 30에포크면 충분
-    HN_K = 100                   # 20개 추출 후 내부 0.95 제약으로 필터링
-    
-    HASH_SIZE = 1000
-    cfg.num_prod_types = HASH_SIZE
-    cfg.num_colors = HASH_SIZE
-    cfg.num_graphics = HASH_SIZE
-    cfg.num_sections = HASH_SIZE
-    TARGET_VAL_PATH = os.path.join(cfg.base_dir, "features_target_val.parquet")
-
-    # 2. Data & Metadata 가져오기
-    aligned_vecs = load_aligned_pretrained_embeddings(processor, cfg.base_dir, cfg.pretrained_dim)
-    log_q_tensor = processor.get_logq_probs(device)
-    
-    item_metadata_tensor = load_item_metadata_hashed(processor, cfg.base_dir, hash_size=HASH_SIZE)
-    processor.i_side_arr = item_metadata_tensor.numpy()
-    val_processor.i_side_arr = processor.i_side_arr
-    
-    train_loader = create_dataloaders(processor, cfg, "2020-09-16", aligned_vecs, is_train=True)
-    val_loader = create_dataloaders(val_processor, cfg, "2020-09-22", aligned_vecs, is_train=False)
-    
-    json_path = os.path.join(cfg.base_dir, "filtered_data_reinforced.json")
-    item_category_ids = create_category_mapping_tensor(json_path, processor, device)
-
-    wandb.init(
-        project="SASRec-User-Tower-causality-Optimization-v2",
-        name=f"Resume_SessionWeight_lr{cfg.lr}_K{HN_K}", 
-        config=cfg.__dict__ 
-    )
-    
-    # -----------------------------------------------------------
-    # 3. Models Setup & 💡 Epoch 11 베이스라인 가중치 로드
-    # -----------------------------------------------------------
-    user_tower, item_tower = setup_models(cfg, device, None, log_q_tensor) 
-    
-    # 💡 [요청 사항 1] 모델 경로 지정 및 로드
-    base_user_pth = os.path.join(cfg.base_dir, "best_user_tower_hn_v3_hnm_e16.pth")
-    base_item_pth = os.path.join(cfg.base_dir, "best_item_tower_hn_v3_hnm_e16.pth")
-    
-    print(f"📥 Loading Baseline Models from Epoch 11...")
-    user_tower.load_state_dict(torch.load(base_user_pth, map_location=device))
-    item_tower.load_state_dict(torch.load(base_item_pth, map_location=device))
-    print(f"✅ Baseline Models loaded successfully.")
-
-    # 💡 [요청 사항 2] 처음부터 Item Tower 해동 (Unfreeze) 및 비대칭 LR 적용
-    print("🔥 Epoch 12 (Resume): Item Tower is UNFROZEN from the start!")
-    item_tower.set_freeze_state(False)
-    item_finetune_lr = cfg.lr * 0.05 
-    
-    # Optimizer에 두 타워를 동시에 등록 (LR 비대칭)
-    optimizer = torch.optim.AdamW([
-        {'params': user_tower.parameters(), 'lr': cfg.lr},
-        {'params': item_tower.parameters(), 'lr': item_finetune_lr}
-    ], weight_decay=cfg.weight_decay, fused=True)
-    
-    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
-    
-    total_steps = len(train_loader) * cfg.epochs
-    warmup_steps = int(total_steps * 0.05) 
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01) 
-    
-    early_stopping = EarlyStopping(patience=7, mode='max')
-
-    # -----------------------------------------------------------
-    # 4. Training Loop (💡 자연스러운 출력을 위해 에포크 10부터 시작)
-    # -----------------------------------------------------------
-    start_epoch = 16
-    end_epoch = start_epoch + cfg.epochs
-    
-    epoch_hn_pool = None
-
-    for epoch in range(start_epoch, end_epoch):
-        
-        # 💡 분기 삭제됨: 이미 위에서 Item Tower를 해동했으므로 epoch 5 로직 제거
-        
-        # 💡 재학습 시작(Epoch 12)과 동시에 마이닝 즉시 발동
-        if (epoch - 10) % 2 == 0:
-            print(f"\n🔍 [Epoch {epoch} Start] Mining Category-Constrained Hard Negatives (K={HN_K})...")
-            item_tower.eval() 
-            with torch.no_grad():
-                all_item_embs = item_tower.get_all_embeddings()
-                norm_item_embs = F.normalize(all_item_embs, p=2, dim=1)
-                
-                epoch_hn_pool = mine_category_constrained_hard_negatives(
-                    norm_item_embs, item_category_ids, k=HN_K, device=device
-                )
-                
-                del all_item_embs, norm_item_embs
-                torch.cuda.empty_cache()
-                
-            item_tower.train()
-
-        else: 
-            print(f"\n♻️ [Epoch {epoch} Start] Using Cached Hard Negative Pool (No Mining Overheads)")
-        
-        current_lr = scheduler.get_last_lr()[0]
-        print(f"Epoch [{epoch}]  - Current LR: {current_lr:.8f}")  
-        
-        # ------------------- 훈련 (Train) -------------------
-        avg_loss = train_user_tower_all_time(
-            epoch=epoch,
-            model=user_tower,
-            item_tower=item_tower, 
-            log_q_tensor=log_q_tensor,
-            dataloader=train_loader,
-            optimizer=optimizer,
-            scaler=scaler,
-            cfg=cfg,
-            device=device,
-            hard_neg_pool_tensor=epoch_hn_pool, # 💡 방금 뽑은 최신 HN 풀 전달
-            scheduler=scheduler, 
-            seq_labels=SEQ_LABELS,
-            static_labels=STATIC_LABELS,
-        )
-        
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        
-        # ------------------- 평가 (Evaluate) -------------------
-        val_metrics = evaluate_model(
-            model=user_tower, 
-            item_tower=item_tower, 
-            dataloader=val_loader,
-            target_df_path=TARGET_VAL_PATH,
-            device=device,
-            processor=processor,
-            k_list=[10, 20, 100, 500]
-        )
-        
-        current_recall_20 = val_metrics.get('Recall@20', 0.0)
-        
-        # ------------------- 스케줄러 & Best Model 저장 -------------------
-        early_stopping(current_recall_20)
-        
-        if early_stopping.is_best:
-            print(f"🌟 [New Best!] Recall@20 updated: {current_recall_20:.2f}%")
-            
-            # 💡 [요청 사항 3] 저장 이름 변경 (session_weights 명시)
-            save_user_pth = os.path.join(cfg.model_dir, "best_user_tower_hn_v3_hnm_alpha.pth")
-            save_item_pth = os.path.join(cfg.model_dir, "best_item_tower_hn_v3_hnm_alpha.pth")
-            
-            torch.save(user_tower.state_dict(), save_user_pth)
-            torch.save(item_tower.state_dict(), save_item_pth)
-            print(f"   💾 Best model weights saved to: {save_user_pth}")
-            
-        if early_stopping.early_stop:
-            print(f"\n🛑 조기 종료 발동! {early_stopping.patience} Epoch 동안 Recall@20이 개선되지 않았습니다.")
-            print(f"🏆 최종 최고 Recall@20: {early_stopping.best_score:.2f}%")
-            break
-            
-    print("\n🎉 Resume Pipeline Execution Finished Successfully!")
     
 def align_teacher_embeddings(processor, lightgcl_user_embs, gcl_user2id, device):
     """
@@ -637,21 +462,39 @@ def evaluate_weighted_score_ensemble_recall_safe(
     return results
 
 
-if __name__ == "__main__":
-    # 5에포크까지 학습했으므로 6번부터 재개
-    #run_resume_pipeline(resume_epoch=16, last_best_recall=22.60)
-    #run_pipeline_opt_v2()
+def resume_pipeline_session_weights():
+    """
+    Epoch 11까지 학습된 베이스라인 모델을 불러와서,
+    Session-aware 가중치와 HNM을 결합하여 재학습(Resume)하는 엔트리 포인트
+    """
+    print("🚀 Starting User Tower Resume Pipeline (Session Weights & HNM)...")
+    
+    
+    SEQ_LABELS = ['item_id', 'recency_curr', 'week_curr', 'item_type', 'target_week']
+    STATIC_LABELS = [
+        'age', 'price',
+        'channel', 'club', 'news', 'fn', 'active',
+        'cont_price_std', 'cont_last_diff', 'cont_repurch', 'cont_weekend'
+    ] 
+    
+    # 1. Config & Env
     cfg = PipelineConfig()
     device = setup_environment()
-    processor, val_processor, cfg = prepare_features(cfg)
+    processor , val_processor, cfg = prepare_features(cfg)
+    
+    stage_status= [0,0,0,0,0,0,0]
     
     # -----------------------------------------------------------
     # 💡 하드 네거티브 및 하이퍼파라미터 세팅
     # -----------------------------------------------------------
-    cfg.lr = 1.8e-3               # 기존 학습률 유지
-    cfg.epochs = 24             # 이미 11에포크를 돌았으므로, 추가로 30에포크면 충분
-    HN_K = 100                   # 20개 추출 후 내부 0.95 제약으로 필터링
-    
+    cfg.lr = 1.6e-3               # 기존 학습률 유지
+    cfg.epochs = 60         # 이미 11에포크를 돌았으므로, 추가로 30에포크면 충분
+    cfg.HN_K = 150  # 20개 추출 후 내부 0.95 제약으로 필터링
+    cfg.EX_TOP_K = 0
+    cfg.soft_penalty_weigh = 1
+    cfg.batch_size = 512
+    cfg.hn_scheduled = False
+    cfg.dropout = 0.3
     HASH_SIZE = 1000
     cfg.num_prod_types = HASH_SIZE
     cfg.num_colors = HASH_SIZE
@@ -670,9 +513,14 @@ if __name__ == "__main__":
     train_loader = create_dataloaders(processor, cfg, "2020-09-16", aligned_vecs, is_train=True)
     val_loader = create_dataloaders(val_processor, cfg, "2020-09-22", aligned_vecs, is_train=False)
     
-    json_path = os.path.join(cfg.base_dir, "filtered_data_reinforced.json")
-    item_category_ids = create_category_mapping_tensor(json_path, processor, device)
-
+    #json_path = os.path.join(cfg.base_dir, "filtered_data_reinforced.json")
+    #item_category_ids = create_category_mapping_tensor(json_path, processor, device)
+    
+    wandb.init(
+        project="SASRec-User-Tower-causality-Optimization-v2",
+        name=f"Resume_SessionWeight_lr{cfg.lr}_K{cfg.HN_K}", 
+        config=cfg.__dict__ 
+    )
     
     # -----------------------------------------------------------
     # 3. Models Setup & 💡 Epoch 11 베이스라인 가중치 로드
@@ -680,39 +528,360 @@ if __name__ == "__main__":
     user_tower, item_tower = setup_models(cfg, device, None, log_q_tensor) 
     
     # 💡 [요청 사항 1] 모델 경로 지정 및 로드
-    base_user_pth = os.path.join(cfg.base_dir, "best_user_tower_hn_v3_hnm_alpha (1).pth")
-    base_item_pth = os.path.join(cfg.base_dir, "best_item_tower_hn_v3_hnm_alpha (1).pth")
+    base_user_pth = os.path.join(cfg.model_dir, "best_user_tower_from_scratch_base_dout.pth")
+    base_item_pth = os.path.join(cfg.model_dir, "best_item_tower_from_scratch_base_dout.pth")
+    
+    save_user_pth = os.path.join(cfg.model_dir, "best_user_tower_0308_p2_hn.pth")
+    save_item_pth = os.path.join(cfg.model_dir, "best_item_tower_0308_p2_hh.pth")
+
+    item_tower.init_from_pretrained(aligned_vecs.to(device))
     
     print(f"📥 Loading Baseline Models from Epoch 11...")
     user_tower.load_state_dict(torch.load(base_user_pth, map_location=device))
     item_tower.load_state_dict(torch.load(base_item_pth, map_location=device))
     print(f"✅ Baseline Models loaded successfully.")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    
+    print("🔥 Epoch 12 (Resume): Item Tower is UNFROZEN from the start!")
+    item_tower.set_freeze_state(False)
+    item_finetune_lr = cfg.lr * 0.05
+    
+    # Optimizer에 두 타워를 동시에 등록 (LR 비대칭)
+    optimizer = torch.optim.AdamW([
+        {'params': user_tower.parameters(), 'lr': cfg.lr},
+        {'params': item_tower.parameters(), 'lr': item_finetune_lr}
+    ], weight_decay=cfg.weight_decay, fused=True)
+    
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
+    
+    total_steps = len(train_loader) * cfg.epochs
+    warmup_steps = int(total_steps * 0.025) 
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01) 
+    
+    early_stopping = EarlyStopping(patience=7, mode='max')
 
+    # 스케줄러에 w조절 포함, if not chnage
 
+        
 
-    # =====================================================================
-    # 2. GNN (LightGCL) 임베딩 로드
-    # =====================================================================
-    # 정렬 로직을 거치지 않은 순수 LightGCL 임베딩(0-based)을 그대로 불러옵니다.
-    print("📥 Loading LightGCL Embeddings...")
-    gnn_user_matrix,gnn_item_matrix  = lightgcl_importer()
+    # HNM 동적 스케줄러
+    if cfg.hn_scheduled:
+        hn_scheduler = BidirectionalHNScheduler(
+            initial_ex_top_k=cfg.EX_TOP_K, 
+            margin_drop_ratio=0.95, penalty_rise_ratio=1.05,   
+            margin_growth_ratio=1.05, penalty_drop_ratio=0.95, 
+            window_size=2, step_size=10,
+            min_ex_top_k=20, max_ex_top_k=120, cooldown_epochs=1
+        )
+    else:
+        hn_scheduler = None
+    
+    force_mining_next_epoch = False
+    epoch_hn_pool = None
+    # -----------------------------------------------------------
+    # 4. Training Loop (💡 자연스러운 출력을 위해 에포크 10부터 시작)
+    # -----------------------------------------------------------
+    start_epoch = 10
+    end_epoch = start_epoch + cfg.epochs
+    #prev_ex_top_k = cfg.EX_TOP_K 
+    for epoch in range(start_epoch, end_epoch):
+        
+        
+        item_tower.eval()
+        with torch.no_grad():
+            print(f"📦 [Epoch {epoch}] Caching All Item Embeddings for Training...")
+            all_item_embs = item_tower.get_all_embeddings()
+            norm_item_embeddings = F.normalize(all_item_embs, p=2, dim=1) # [50000, Dim]
+            
+            # 10에포크부터는 이 캐시된 임베딩을 마이닝에도 재사용하여 속도 극대화
+            if epoch >= 10:
+                if (epoch - 10) % 1 == 0 or force_mining_next_epoch:
+                    print(f"🔍 Mining Global Hard Negatives using cached embeddings...")
+                    epoch_hn_pool = mine_global_hard_negatives(
+                        norm_item_embeddings, # 다시 계산 안 하고 캐시본 사용
+                        exclusion_top_k=0, 
+                        mine_k=200, 
+                        batch_size=2048, 
+                        device=device
+                    )
+                    force_mining_next_epoch = False
+                    #if (hn_scheduler.ex_top_k if hn_scheduler else cfg.EX_TOP_K)<= 80:
+                    #    if prev_ex_top_k < (hn_scheduler.ex_top_k if hn_scheduler else cfg.EX_TOP_K):
+                    #        cfg.soft_penalty_weigh = cfg.soft_penalty_weigh - 0.1
+                    #        print(f" return weight.....")
+                    #    else:
+                    #        cfg.soft_penalty_weigh = (cfg.EX_TOP_K - hn_scheduler.ex_top_k - 10) * 0.1 + 1.0
+                    #        print(f" Add soft_penalty for protect embedding loss explosivee...")
+                    #else:
+                    #    cfg.soft_penalty_weigh = 1.0
 
-    # =====================================================================
-    # 3. 앙상블 평가 함수 실행
-    # =====================================================================
-    print("🚀 Launching Ensemble Evaluation...")
-    ensemble_results = evaluate_weighted_score_ensemble_recall_safe(
-        model=user_tower,                        # SASRec User Tower
-        item_tower=item_tower,              # SASRec Item Tower
-        dataloader=val_loader,              # Validation DataLoader
-        target_df_path=TARGET_VAL_PATH,    # Parquet 정답지 경로
-        gnn_user_matrix=gnn_user_matrix,    # 로드한 LightGCL 유저 임베딩 (0-based)
-        gnn_item_matrix=gnn_item_matrix,    # 로드한 LightGCL 아이템 임베딩 (0-based)
-        device=device,                      # GPU Device
-        processor=processor,                # FeatureProcessor_v3 인스턴스
-        k_list=[10, 20, 200, 500],          # 측정할 Top-K 리스트
-        alpha_step=0.1,                     # 1.0부터 0.0까지 0.1 단위로 탐색 (총 11개 스텝)
-        candidate_pool_size=1000            # 각 모델에서 추출할 후보군 크기 (max_k인 500의 2배로 설정)
+            else:
+                # 💡 Epoch 1 ~ 9: 워밍업 기간 (HNM 없음)
+                epoch_hn_pool = None
+                force_mining_next_epoch = False
+                print(f"\n🌱 [Epoch {epoch} Start] Warm-up Phase: Using In-batch Random Negatives (No HNM)")
+        item_tower.train()
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch [{epoch}/{cfg.epochs}]  - Current LR: {current_lr:.8f}")
+        
+        # ------------------- 훈련 (Train) -------------------
+        avg_loss, force_mining_next_epoch = train_user_tower_cl_enhance(
+            epoch=epoch,
+            model=user_tower,
+            item_tower=item_tower, 
+            norm_item_embeddings=norm_item_embeddings,
+            log_q_tensor=log_q_tensor,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            scaler=scaler,
+            cfg=cfg,
+            device=device,
+            hard_neg_pool_tensor=epoch_hn_pool, # Epoch 1~9는 None, 10부터 텐서 주입
+            scheduler=scheduler, 
+            hn_scheduler=hn_scheduler,
+            seq_labels=SEQ_LABELS,
+            static_labels=STATIC_LABELS,
+        )
+        del norm_item_embeddings
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        #prev_ex_top_k = hn_scheduler.ex_top_k if hn_scheduler else cfg.EX_TOP_K
+                        
+        # ------------------- 평가 (Evaluate) -------------------
+        
+        val_metrics = evaluate_model(
+            model=user_tower, 
+            item_tower=item_tower, 
+            dataloader=val_loader,
+            target_df_path=TARGET_VAL_PATH,
+            device=device,
+            processor=processor,
+            k_list=[10, 20, 100, 500]
+        )
+        
+        current_recall_20 = val_metrics.get('Recall@20', 0.0)
+        
+        # ------------------- 스케줄러 & Best Model 저장 -------------------
+        early_stopping(current_recall_20)
+        
+        if early_stopping.is_best:
+            print(f"🌟 [New Best!] Recall@20 updated: {current_recall_20:.2f}%")
+            
+        
+            torch.save(user_tower.state_dict(), save_user_pth)
+            torch.save(item_tower.state_dict(), save_item_pth)
+            print(f"   💾 Best model weights saved to: {save_user_pth}")
+            
+        if early_stopping.early_stop:
+            print(f"\n🛑 조기 종료 발동! {early_stopping.patience} Epoch 동안 Recall@20이 개선되지 않았습니다.")
+            print(f"🏆 최종 최고 Recall@20: {early_stopping.best_score:.2f}%")
+            break
+            
+    print("\n🎉 Resume Pipeline Execution Finished Successfully!")
+    
+    
+def train_pipeline_from_scratch():
+    """
+    처음부터 모델을 학습하며, Epoch 1~9는 랜덤 네거티브로 워밍업,
+    Epoch 10부터 HNM(Hard Negative Mining)을 도입하는 파이프라인
+    """
+    print("🚀 Starting User Tower Training Pipeline (From Scratch + Delayed HNM)...")
+    
+    SEQ_LABELS = ['item_id', 'recency_curr', 'week_curr', 'item_type', 'target_week']
+    STATIC_LABELS = [
+        'age', 'price',
+        'channel', 'club', 'news', 'fn', 'active',
+        'cont_price_std', 'cont_last_diff', 'cont_repurch', 'cont_weekend'
+    ] 
+    
+    # 1. Config & Env
+    cfg = PipelineConfig()
+    device = setup_environment()
+    processor, val_processor, cfg = prepare_features(cfg)
+    
+    # -----------------------------------------------------------
+    # 💡 하이퍼파라미터 세팅
+    # -----------------------------------------------------------
+    cfg.lr = 2e-3
+    cfg.epochs = 40            # 처음부터 학습하므로 넉넉하게 40에포크 설정
+    cfg.HN_K = 150             # HNM 발동 시 추출할 풀 사이즈
+    cfg.EX_TOP_K = 0
+    cfg.soft_penalty_weigh = 1.0
+    cfg.hn_scheduled = False
+    cfg.batch_size = 512
+    cfg.dropout = 0.3
+    FREEZE_ITEM_EPOCHS = 3
+    HASH_SIZE = 1000
+    cfg.num_prod_types = HASH_SIZE
+    cfg.num_colors = HASH_SIZE
+    cfg.num_graphics = HASH_SIZE
+    cfg.num_sections = HASH_SIZE
+    TARGET_VAL_PATH = os.path.join(cfg.base_dir, "features_target_val.parquet")
+
+    # 2. Data & Metadata 가져오기
+    aligned_vecs = load_aligned_pretrained_embeddings(processor, cfg.model_dir, cfg.pretrained_dim)
+    log_q_tensor = processor.get_logq_probs(device)
+    
+    item_metadata_tensor = load_item_metadata_hashed(processor, cfg.base_dir, hash_size=HASH_SIZE)
+    processor.i_side_arr = item_metadata_tensor.numpy()
+    val_processor.i_side_arr = processor.i_side_arr
+    
+    train_loader = create_dataloaders(processor, cfg, "2020-09-16", aligned_vecs, is_train=True)
+    val_loader = create_dataloaders(val_processor, cfg, "2020-09-22", aligned_vecs, is_train=False)
+    
+    wandb.init(
+        project="SASRec-User-Tower-causality-Optimization-v2",
+        name=f"FromScratch_DelayedHNM_lr{cfg.lr}_K{cfg.HN_K}", 
+        config=cfg.__dict__ 
     )
+    
+    # -----------------------------------------------------------
+    # 3. Models Setup (가중치 로드 없이 초기화)
+    # -----------------------------------------------------------
+    user_tower, item_tower = setup_models(cfg, device, None, log_q_tensor) 
+    
+    save_user_pth = os.path.join(cfg.model_dir, "best_user_tower_from_scratch_local.pth")
+    save_item_pth = os.path.join(cfg.model_dir, "best_item_tower_from_scratch_local.pth")
+    item_tower.init_from_pretrained(aligned_vecs.to(device))
+    print(f"❄️ Item Tower is Frozen for the first {FREEZE_ITEM_EPOCHS} epochs.")
+    item_tower.set_freeze_state(True)
+    
+    # 💡 [참고] 처음부터 학습할 때는 Item Tower의 LR을 낮추지 않고 동일하게 가는 것도 좋습니다.
+    # 만약 Pretrained 임베딩이 많이 깨지는 것을 방지하고 싶다면 현재처럼 0.05배율을 유지하세요.
+    item_finetune_lr = cfg.lr * 0.05
+    
+    optimizer = torch.optim.AdamW([
+        {'params': user_tower.parameters(), 'lr': cfg.lr},
+        {'params': item_tower.parameters(), 'lr': item_finetune_lr}
+    ], weight_decay=cfg.weight_decay, fused=True)
+    
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
+    
+    total_steps = len(train_loader) * cfg.epochs
+    warmup_steps = int(total_steps * 0.05) 
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01) 
+    early_stopping = EarlyStopping(patience=7, mode='max')
+
+    # HNM 동적 스케줄러
+    if cfg.hn_scheduled:
+        hn_scheduler = BidirectionalHNScheduler(
+            initial_ex_top_k=cfg.EX_TOP_K, 
+            margin_drop_ratio=0.95, penalty_rise_ratio=1.05,   
+            margin_growth_ratio=1.05, penalty_drop_ratio=0.95, 
+            window_size=2, step_size=5,
+            min_ex_top_k=20, max_ex_top_k=100, cooldown_epochs=1
+        )
+    else:
+        hn_scheduler = None
+    
+    force_mining_next_epoch = False
+    epoch_hn_pool = None
+    
+    # -----------------------------------------------------------
+    # 4. Training Loop (Epoch 1부터 시작)
+    # -----------------------------------------------------------
+    for epoch in range(1, cfg.epochs + 1):
+        
+        
+        if epoch == FREEZE_ITEM_EPOCHS + 1:
+            print(f"🔥 Epoch {epoch}: Unfreezing Item Tower for Joint Training!")
+            item_tower.set_freeze_state(False)
+        
+        item_tower.eval()
+        with torch.no_grad():
+            print(f"📦 [Epoch {epoch}] Caching All Item Embeddings for Training...")
+            all_item_embs = item_tower.get_all_embeddings()
+            norm_item_embeddings = F.normalize(all_item_embs, p=2, dim=1) # [50000, Dim]
+            
+            # 10에포크부터는 이 캐시된 임베딩을 마이닝에도 재사용하여 속도 극대화
+            if epoch >= 10:
+                if (epoch - 10) % 1 == 0 or force_mining_next_epoch:
+                    print(f"🔍 Mining Global Hard Negatives using cached embeddings...")
+                    epoch_hn_pool = mine_global_hard_negatives(
+                        norm_item_embeddings, # 다시 계산 안 하고 캐시본 사용
+                        exclusion_top_k=0 ,
+                        mine_k=150, 
+                        batch_size=2048, 
+                        device=device
+                    )
+                    force_mining_next_epoch = False
+                    #if hn_scheduler.ex_top_k <= 40:
+                    #    cfg.soft_penalty_weigh = (cfg.EX_TOP_K - hn_scheduler.ex_top_k) * 0.1 + 1.0
+                    #    print(f" Add soft_penalty for protect embedding loss explosivee...")
+                    #else:
+                    #    cfg.soft_penalty_weigh = 1.0
+
+            else:
+                # 💡 Epoch 1 ~ 9: 워밍업 기간 (HNM 없음)
+                epoch_hn_pool = None
+                force_mining_next_epoch = False
+                print(f"\n🌱 [Epoch {epoch} Start] Warm-up Phase: Using In-batch Random Negatives (No HNM)")
+        
+        item_tower.train() # 학습 모드 복구
+        
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch [{epoch}/{cfg.epochs}]  - Current LR: {current_lr:.8f}")
+        
+        # ------------------- 훈련 (Train) -------------------
+        avg_loss, force_mining_next_epoch = train_user_tower_cl_enhance(
+            epoch=epoch,
+            model=user_tower,
+            item_tower=item_tower, 
+            norm_item_embeddings=norm_item_embeddings,
+            log_q_tensor=log_q_tensor,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            scaler=scaler,
+            cfg=cfg,
+            device=device,
+            hard_neg_pool_tensor=epoch_hn_pool, # Epoch 1~9는 None, 10부터 텐서 주입
+            scheduler=scheduler, 
+            hn_scheduler=hn_scheduler,
+            seq_labels=SEQ_LABELS,
+            static_labels=STATIC_LABELS,
+        )
+        del norm_item_embeddings
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        
+        # ------------------- 평가 (Evaluate) -------------------
+        val_metrics = evaluate_model(
+            model=user_tower, 
+            item_tower=item_tower, 
+            dataloader=val_loader,
+            target_df_path=TARGET_VAL_PATH,
+            device=device,
+            processor=processor,
+            k_list=[10, 20, 100, 500]
+        )
+        
+        current_recall_20 = val_metrics.get('Recall@20', 0.0)
+        
+        # ------------------- 스케줄러 & Best Model 저장 -------------------
+        early_stopping(current_recall_20)
+        
+        if early_stopping.is_best:
+            print(f"🌟 [New Best!] Recall@20 updated: {current_recall_20:.2f}%")
+            torch.save(user_tower.state_dict(), save_user_pth)
+            torch.save(item_tower.state_dict(), save_item_pth)
+            print(f"   💾 Best model weights saved to: {save_user_pth}")
+        if epoch == 9:
+            print(f"🔔 [Checkpoint] Epoch {epoch} completed. Current Recall@20: {current_recall_20:.2f}%")
+            base_user_pth =os.path.join(cfg.model_dir, "best_user_tower_from_scratch_base_dout.pth")
+            base_item_pth= os.path.join(cfg.model_dir, "best_item_tower_from_scratch_base_dout.pth")
+            
+            torch.save(user_tower.state_dict(), base_user_pth)
+            torch.save(item_tower.state_dict(), base_item_pth)
+        if early_stopping.early_stop:
+            print(f"\n🛑 조기 종료 발동! {early_stopping.patience} Epoch 동안 Recall@20이 개선되지 않았습니다.")
+            print(f"🏆 최종 최고 Recall@20: {early_stopping.best_score:.2f}%")
+            break
+            
+    print("\n🎉 From-Scratch Pipeline Execution Finished Successfully!")
+    
+if __name__ == "__main__":
+    # 5에포크까지 학습했으므로 6번부터 재개
+    #run_resume_pipeline(resume_epoch=16, last_best_recall=22.60)
+    #run_pipeline_opt_v2()
+    train_pipeline_from_scratch()
     #run_resume_pipeline_v2()

@@ -74,7 +74,7 @@ def dataset_peek_v3(dataset, processor):
 def make_user_features_v3(train_df, target_val_path, USER_META_PATH, USER_FEAT_VAL_PATH_PQ):
     print("\n👤 [User Stats] Calculating AS-OF Sequence Features (Zero Time Leakage)...")
 
-
+    '''
     if target_val_path != None:
 
         print("\n🎯 [Validation User Stats] Preparing point-in-time features...")
@@ -88,8 +88,30 @@ def make_user_features_v3(train_df, target_val_path, USER_META_PATH, USER_FEAT_V
         # (이미 full_df가 9/15 이전 데이터라면 날짜 필터는 생략 가능)
         train_df = train_df[train_df['customer_id'].isin(val_user_set)].copy()
         print(f" -> Using {len(train_df):,} transaction records for feature calculation.")
+    '''
+    # 💡 [핵심 추가 1] 전체 Train 데이터에서 "Warm User(최소 3개 이상 구매)" 추출
+    train_user_counts = train_df.groupby('customer_id').size()
+    warm_train_users = set(train_user_counts[train_user_counts >= 3].index)
 
+    if target_val_path != None:
+        print("\n🎯 [Validation User Stats] Preparing point-in-time features...")
 
+        # 1. 평가 대상 유저 ID 추출 (정답지가 있는 유저들: 최소 1개 이상 구매자)
+        target_val = pd.read_parquet(target_val_path)
+        val_user_set = set(target_val['customer_id'].unique())
+        print(f" -> Found {len(val_user_set):,} users with targets in validation period.")
+
+        # 💡 [핵심 추가 2] 교집합(Intersection): 정답도 있고, 과거 이력도 3개 이상인 완벽한 타겟만 필터링
+        final_valid_users = val_user_set.intersection(warm_train_users)
+        print(f" -> 🛡️ [Filter] Retained {len(final_valid_users):,} strictly valid users (Target >= 1 & History >= 3).")
+
+        # 2. 9/15 이전 거래 중 '최종 평가 대상 유저'의 기록만 추출
+        train_df = train_df[train_df['customer_id'].isin(final_valid_users)].copy()
+        
+    else:
+        # Train 모드일 경우: Warm User만 남김
+        train_df = train_df[train_df['customer_id'].isin(warm_train_users)].copy()
+        print(f" -> 🛡️ [Filter] Retained {len(warm_train_users):,} warm users (History >= 3) for Training.")
 
 
 

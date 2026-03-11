@@ -882,7 +882,7 @@ def mine_category_constrained_hard_negatives(item_embs, category_tensor, k=5, de
 
 
 
-def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
+def inbatch_corrected_logq_loss_with_hybrid_hard_neg_prev(
     user_emb, item_tower_emb, target_ids, user_ids, log_q_tensor,
     batch_hard_neg_ids=None,
     flat_history_item_ids=None,
@@ -998,4 +998,167 @@ def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
         return loss, metrics
 
     return loss
+
+
+def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
+    user_emb, seq_item_emb, target_ids, user_ids, log_q_tensor,
+    hn_item_emb=None, batch_hard_neg_ids=None,
+    flat_history_item_ids=None,
+    step_weights=None,
+    final_idx=None, # 💡 [핵심 파라미터] 외부에서 계산된 마지막 스텝의 위치 정보
+    temperature=0.1, 
+    lambda_logq=1.0,          
+    alpha=1.0,                
+    margin=0.00,
+    soft_penalty_weight=5.0,
+    return_metrics=False     
+):
+    N = user_emb.size(0)
+    device = user_emb.device
+    SAFE_NEG_INF = -1e9
+    
+    # 가중치 텐서 준비
+    if step_weights is not None:
+        step_weights = torch.as_tensor(step_weights, device=device, dtype=torch.float32)
+        weight_sum = step_weights.sum() + 1e-9
+        sw_unsqueezed = step_weights.unsqueeze(1)
+    else:
+        weight_sum = None
+        sw_unsqueezed = None
+
+    # -----------------------------------------------------------
+    # 1. In-batch Logits 계산 (전체 N개 스텝 대상)
+    # -----------------------------------------------------------
+    sim_matrix = torch.matmul(user_emb, seq_item_emb.T) 
+    pos_sim = torch.diagonal(sim_matrix) # [N]
+    labels = torch.arange(N, device=device)
+    logits = sim_matrix / temperature
+
+    if margin > 0.0:
+        logits[labels, labels] -= (margin / temperature)
+
+    if lambda_logq > 0.0:
+        batch_log_q = log_q_tensor[target_ids]
+        logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
+
+    # In-batch 내 가짜 네거티브(False Negative) 마스킹
+    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
+    same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
+    same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
+    false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
+    logits = logits.masked_fill(false_neg_mask, SAFE_NEG_INF)
+    
+    metrics = {}
+    
+    # -----------------------------------------------------------
+    # 2. Hard Negative Processing (오직 final_idx 위치만 연산 및 조립)
+    # -----------------------------------------------------------
+    num_hn_to_use = 50
+    
+    if hn_item_emb is not None and batch_hard_neg_ids is not None and final_idx is not None and final_idx.numel() > 0:
         
+        num_finals = final_idx.size(0)
+        pool_multiplier = 3
+        num_pool = num_hn_to_use * pool_multiplier  
+        skip_top_k = 10 
+
+        u_emb_f = user_emb[final_idx]                  # [num_finals, D]
+        pos_sim_f = pos_sim[final_idx]                 # [num_finals]
+        
+        hn_emb_f = hn_item_emb                         
+        hn_ids_f = batch_hard_neg_ids                  
+        
+        flat_hist_f = flat_history_item_ids[final_idx] if flat_history_item_ids is not None else None
+
+        # [STEP 1] 기울기(Gradient) 추적 없이 후보군 필터링
+        with torch.no_grad():
+            hn_emb_no_grad_f = hn_emb_f.detach() 
+            hn_sim_no_grad_f = torch.bmm(u_emb_f.unsqueeze(1), hn_emb_no_grad_f.transpose(1, 2)).squeeze(1)
+            
+            absolute_fn_mask_f = torch.zeros_like(hn_sim_no_grad_f, dtype=torch.bool, device=device)
+            if flat_hist_f is not None:
+                absolute_fn_mask_f = (hn_ids_f.unsqueeze(2) == flat_hist_f.unsqueeze(1)).any(dim=2)
+            
+            boundary_ratio = 0.80
+            dynamic_boundary_f = pos_sim_f.unsqueeze(1) * boundary_ratio 
+            dynamic_fn_mask_f = hn_sim_no_grad_f >= dynamic_boundary_f
+            
+            final_fn_mask_f = absolute_fn_mask_f | dynamic_fn_mask_f
+            masked_sims_f = hn_sim_no_grad_f.masked_fill(final_fn_mask_f, -1e4)
+            
+            _, top_idx_all_f = torch.topk(masked_sims_f, num_pool + skip_top_k, dim=1)
+            top_idx_pool_f = top_idx_all_f[:, skip_top_k:]
+
+            rand_idx_f = torch.rand(num_finals, num_pool, device=device).argsort(dim=1)[:, :num_hn_to_use]
+            top_idx_f = torch.gather(top_idx_pool_f, 1, rand_idx_f)
+
+        # [STEP 2] 본 학습용 임베딩 조립 (initial N개)
+        batch_hn_ids_final_f = torch.gather(hn_ids_f, 1, top_idx_f)
+        top_idx_expanded_f = top_idx_f.unsqueeze(-1).expand(-1, -1, hn_emb_f.size(2))
+        hn_emb_final_f = torch.gather(hn_emb_f, 1, top_idx_expanded_f).detach()
+
+        # [STEP 3] 본 연산 (Gradient 흐름)
+        hn_sim_f = torch.bmm(u_emb_f.unsqueeze(1), hn_emb_final_f.transpose(1, 2)).squeeze(1) 
+        hn_logits_f = (hn_sim_f / temperature) * alpha
+        
+        if lambda_logq > 0.0:
+            hn_log_q_f = log_q_tensor[batch_hn_ids_final_f] 
+            hn_logits_f = hn_logits_f - (hn_log_q_f * lambda_logq)
+        
+        final_safety_mask_f = hn_sim_f >= (pos_sim_f.unsqueeze(1) * boundary_ratio)
+        hn_logits_f = hn_logits_f.masked_fill(final_safety_mask_f, SAFE_NEG_INF)
+
+        # =======================================================
+        # 💡 [핵심 결합 로직] 전체 N 차원 캔버스에 마지막 스텝(final_idx) 퍼즐 조각 끼워넣기
+        # =======================================================
+        hn_logits_full = torch.full((N, num_hn_to_use), SAFE_NEG_INF, device=device)
+        hn_logits_full[final_idx] = hn_logits_f
+        
+        logits = torch.cat([logits, hn_logits_full], dim=1)
+        
+        if return_metrics:
+            metrics['hn/discarded_ratio'] = dynamic_fn_mask_f.float().mean().item()
+            valid_hn_sim_f = hn_sim_f[~final_safety_mask_f]
+            metrics['sim/hn_true_hard'] = valid_hn_sim_f.mean().item() if valid_hn_sim_f.numel() > 0 else 0.0
+            
+    else: 
+        # HNM이 비활성화되었거나 final_idx가 없을 때 (행렬 차원 유지를 위한 더미 결합)
+        hn_logits_full = torch.full((N, num_hn_to_use), SAFE_NEG_INF, device=device)
+        logits = torch.cat([logits, hn_logits_full], dim=1)
+
+    logits = torch.clamp(logits, min=SAFE_NEG_INF, max=1e4)
+
+    # -----------------------------------------------------------
+    # 3. Loss 계산 (Cross Entropy)
+    # -----------------------------------------------------------
+    if step_weights is not None:
+        loss_unreduced = F.cross_entropy(logits, labels, reduction='none')
+        loss = (loss_unreduced * step_weights).sum() / weight_sum
+        if return_metrics:
+            metrics['sim/pos'] = ((pos_sim * step_weights).sum() / weight_sum).item()
+    else:
+        loss = F.cross_entropy(logits, labels)
+        if return_metrics:
+            metrics['sim/pos'] = pos_sim.mean().item()
+
+    # -----------------------------------------------------------
+    # 4. Probabilities Metrics
+    # -----------------------------------------------------------
+    if return_metrics:
+        with torch.no_grad():
+            probs = F.softmax(logits, dim=1)
+            if hn_item_emb is not None and batch_hard_neg_ids is not None and final_idx is not None and final_idx.numel() > 0:
+                hn_probs_sum = probs[:, N:].sum(dim=1) 
+                neg_probs_total = 1.0 - probs.diagonal() 
+                relative_hn_ratio = hn_probs_sum / (neg_probs_total + 1e-9) 
+                
+                if step_weights is not None:
+                    metrics['hn/influence_ratio'] = ((hn_probs_sum * step_weights).sum() / weight_sum).item()
+                    metrics['hn/relative_influence'] = ((relative_hn_ratio * step_weights).sum() / weight_sum).item()
+                else:
+                    metrics['hn/influence_ratio'] = hn_probs_sum.mean().item()
+                    metrics['hn/relative_influence'] = relative_hn_ratio.mean().item()
+
+        return loss, metrics
+
+    return loss
