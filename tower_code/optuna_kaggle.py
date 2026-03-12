@@ -2110,3 +2110,232 @@ if __name__ == "__main__":
     print("  Params: ")
     for key, value in trial.params.items():
         print(f"    {key}: {value}")
+class SASRecDataset_v3(Dataset):
+    def __init__(self, processor, global_now_str="2020-09-22", max_len=30, is_train=True):
+        self.processor = processor
+        self.max_len = max_len
+        self.is_train = is_train
+        self.user_ids = processor.user_ids
+        
+        global_now_dt = pd.to_datetime(global_now_str)
+        self.now_ordinal = global_now_dt.toordinal()
+        self.now_week = global_now_dt.isocalendar().week
+
+        if self.is_train: 
+            self.verify_session_logic()
+            
+    def verify_session_logic(self):
+        """디버깅용: 세션 분리 및 셔플링이 정상적으로 작동하는지 1명의 유저를 뽑아 콘솔에 출력합니다."""
+        print("\n" + "="*75)
+        print("🕵️‍♂️ [Dataset Monitor] Session Grouping & Shuffling Verification")
+        print("="*75)
+        
+        sample_user = None
+        for uid in self.user_ids:
+            u_mapped_id = self.processor.user2id.get(uid, 0)
+            if len(self.processor.u_seqs[u_mapped_id]) > 5:
+                sample_user = uid
+                break
+                
+        if not sample_user:
+            print("충분한 시퀀스를 가진 유저가 없습니다.")
+            return
+            
+        u_mapped_id = self.processor.user2id[sample_user]
+        seq_raw = self.processor.u_seqs[u_mapped_id]
+        time_deltas_raw = self.processor.u_deltas[u_mapped_id]
+        
+        session_ids_raw = [1]
+        for i in range(1, len(seq_raw)):
+            if time_deltas_raw[i] == time_deltas_raw[i-1]:
+                session_ids_raw.append(session_ids_raw[-1])
+            else:
+                session_ids_raw.append(session_ids_raw[-1] + 1)
+                
+        input_indices = list(range(len(seq_raw)))
+        grouped_indices = []
+        current_group = [input_indices[0]]
+        for i in range(1, len(input_indices)):
+            if time_deltas_raw[input_indices[i]] == time_deltas_raw[input_indices[i-1]]:
+                current_group.append(input_indices[i])
+            else:
+                grouped_indices.append(current_group)
+                current_group = [input_indices[i]]
+        if current_group: grouped_indices.append(current_group)
+        
+        shuffled_indices = []
+        for group in grouped_indices:
+            group_copy = group.copy()
+            if len(group_copy) > 1:
+                random.shuffle(group_copy) 
+            shuffled_indices.extend(group_copy)
+            
+        print(f"👤 Sample User ID: {sample_user}")
+        print(f"{'Orig_Idx':<9} | {'Item_ID':<11} | {'Delta (Days)':<13} | {'Session_ID':<11} | {'Shuffled_Idx':<13}")
+        print("-" * 75)
+        
+        for i in range(len(seq_raw)):
+            orig_idx = i
+            shuff_idx = shuffled_indices[i] 
+            item_id = seq_raw[shuff_idx]
+            delta = time_deltas_raw[shuff_idx]
+            sess_id = session_ids_raw[shuff_idx]
+            print(f"{orig_idx:<9} | {item_id:<11} | {delta:<13} | {sess_id:<11} | {shuff_idx:<13}")
+        print("="*75 + "\n")
+
+    def _shuffle_indices_within_session(self, indices, time_deltas_raw):
+        if len(indices) <= 1: return indices
+        grouped_indices = []
+        current_group = [indices[0]]
+        
+        for i in range(1, len(indices)):
+            idx = indices[i]
+            prev_idx = indices[i-1] 
+            
+            if time_deltas_raw[idx] == time_deltas_raw[prev_idx]:
+                current_group.append(idx)
+            else:
+                grouped_indices.append(current_group)
+                current_group = [idx]
+                
+        if current_group: grouped_indices.append(current_group)
+        
+        shuffled_indices = []
+        for group in grouped_indices:
+            if len(group) > 1 and random.random() < 0.5:
+                random.shuffle(group)
+            shuffled_indices.extend(group)
+        return shuffled_indices
+
+    def __len__(self):
+        return len(self.user_ids)
+
+    def _get_view_features(self, u_mapped_id, indices, seq_mapped, time_buckets, session_ids_raw, d_time_full):
+        """💡 단일 View에 대한 슬라이싱 및 패딩을 수행하여 딕셔너리로 반환하는 헬퍼 함수"""
+        indices = indices[-self.max_len:]
+        pad_len = self.max_len - len(indices)
+        
+        input_seq = [seq_mapped[i] for i in indices]
+        input_time = [time_buckets[i] for i in indices]
+        input_session = [session_ids_raw[i] for i in indices]
+        
+        d_buckets = self.processor.u_dyn_buckets[u_mapped_id][indices] 
+        d_conts = self.processor.u_dyn_conts[u_mapped_id][indices]    
+        d_cats = self.processor.u_dyn_cats[u_mapped_id][indices]      
+        d_time = self.processor.u_dyn_time[u_mapped_id][indices]      
+
+        input_dates = d_time[:, 0].tolist()
+        current_weeks = d_time[:, 1]
+        
+        if self.is_train:
+            target_seq = [seq_mapped[i + 1] for i in indices]
+            target_indices = [idx + 1 for idx in indices]
+            step_target_times = self.processor.u_dyn_time[u_mapped_id][target_indices, 0]
+            step_target_weeks = self.processor.u_dyn_time[u_mapped_id][target_indices, 1] 
+            dynamic_offsets = np.clip(step_target_times - d_time[:, 0], 0, 365).astype(np.int64)
+        else:
+            target_seq = []
+            dynamic_offsets = np.clip(self.now_ordinal - d_time[:, 0], 0, 365).astype(np.int64)
+            step_target_weeks = np.array([self.now_week] * len(indices))
+
+        # 패딩 처리
+        input_padded = [0] * pad_len + input_seq
+        time_padded = [0] * pad_len + input_time
+        target_padded = [0] * pad_len + target_seq if self.is_train else [0] * self.max_len
+        padding_mask = [True] * pad_len + [False] * len(input_seq)
+        session_padded = [0] * pad_len + input_session
+        target_week_padded = [0] * pad_len + step_target_weeks.tolist()
+        dates_padded = [0] * pad_len + input_dates
+        
+        # 아이템 사이드 정보
+        item_side_info = self.processor.i_side_arr[input_padded]
+        
+        # 동적 피처 패딩
+        pad_b = np.zeros((pad_len, 3), dtype=np.int64)
+        pad_c = np.zeros((pad_len, 4), dtype=np.float32)
+        pad_cat = np.zeros((pad_len, 1), dtype=np.int64)
+        pad_1d = np.zeros(pad_len, dtype=np.int64)
+
+        d_buckets_p = np.vstack([pad_b, d_buckets]) if len(indices) > 0 else pad_b
+        d_conts_p = np.vstack([pad_c, d_conts]) if len(indices) > 0 else pad_c
+        d_cats_p = np.vstack([pad_cat, d_cats]) if len(indices) > 0 else pad_cat
+        offset_p = np.concatenate([pad_1d, dynamic_offsets]) if len(indices) > 0 else pad_1d
+        week_p = np.concatenate([pad_1d, current_weeks]) if len(indices) > 0 else pad_1d
+
+        return {
+            'item_ids': torch.tensor(input_padded, dtype=torch.long),
+            'target_ids': torch.tensor(target_padded, dtype=torch.long),
+            'padding_mask': torch.tensor(padding_mask, dtype=torch.bool),
+            'time_bucket_ids': torch.tensor(time_padded, dtype=torch.long),
+            'session_ids': torch.tensor(session_padded, dtype=torch.long),
+            'type_ids': torch.tensor(item_side_info[:, 0], dtype=torch.long),
+            'color_ids': torch.tensor(item_side_info[:, 1], dtype=torch.long),
+            'graphic_ids': torch.tensor(item_side_info[:, 2], dtype=torch.long),
+            'section_ids': torch.tensor(item_side_info[:, 3], dtype=torch.long),
+            'price_bucket': torch.tensor(d_buckets_p[:, 0], dtype=torch.long),
+            'cnt_bucket': torch.tensor(d_buckets_p[:, 1], dtype=torch.long),
+            'recency_bucket': torch.tensor(d_buckets_p[:, 2], dtype=torch.long),
+            'cont_feats': torch.tensor(d_conts_p, dtype=torch.float32),
+            'channel_ids': torch.tensor(d_cats_p[:, 0], dtype=torch.long),
+            'recency_offset': torch.tensor(offset_p, dtype=torch.long),
+            'current_week': torch.tensor(week_p, dtype=torch.long),
+            'target_week': torch.tensor(target_week_padded, dtype=torch.long),
+            'interaction_dates': torch.tensor(dates_padded, dtype=torch.long),
+        }
+
+    def __getitem__(self, idx):
+        user_id = self.user_ids[idx]
+        u_mapped_id = self.processor.user2id.get(user_id, 0)
+        
+        seq_raw = self.processor.u_seqs[u_mapped_id]
+        time_deltas_raw = self.processor.u_deltas[u_mapped_id]
+        
+        session_ids_raw = [1]
+        for i in range(1, len(seq_raw)):
+            if time_deltas_raw[i] == time_deltas_raw[i-1]:
+                session_ids_raw.append(session_ids_raw[-1]) 
+            else:
+                session_ids_raw.append(session_ids_raw[-1] + 1)
+        
+        seq_mapped = [self.processor.item2id.get(iid, 0) for iid in seq_raw]
+        bins = np.array([0, 3, 7, 14, 30, 60, 180, 330, 395])
+        time_buckets = np.digitize(time_deltas_raw, bins, right=False).tolist()
+
+        # 정적 피처는 View 분리와 상관없이 공통입니다.
+        s_buckets = self.processor.u_static_buckets[u_mapped_id]
+        s_cats = self.processor.u_static_cats[u_mapped_id]
+        
+        base_dict = {
+            'user_ids': user_id,
+            'age_bucket': torch.tensor(s_buckets[0], dtype=torch.long),
+            'club_status_ids': torch.tensor(s_cats[0], dtype=torch.long),
+            'news_freq_ids': torch.tensor(s_cats[1], dtype=torch.long),
+            'fn_ids': torch.tensor(s_cats[2], dtype=torch.long),
+            'active_ids': torch.tensor(s_cats[3], dtype=torch.long),
+        }
+
+        if self.is_train:
+            # 💡 [핵심] 훈련 시 두 번의 독립적인 셔플링 수행
+            input_indices = list(range(len(seq_raw) - 1))
+            indices_v1 = self._shuffle_indices_within_session(input_indices, time_deltas_raw)
+            #indices_v2 = self._shuffle_indices_within_session(input_indices, time_deltas_raw)
+            
+            # View 1 생성 및 병합 (_v1)
+            view_1 = self._get_view_features(u_mapped_id, indices_v1, seq_mapped, time_buckets, session_ids_raw, self.processor.u_dyn_time[u_mapped_id])
+            for k, v in view_1.items():
+                base_dict[f"{k}_v1"] = v
+                
+            # View 2 생성 및 병합 (_v2)
+            #view_2 = self._get_view_features(u_mapped_id, indices_v2, seq_mapped, time_buckets, session_ids_raw, self.processor.u_dyn_time[u_mapped_id])
+            #for k, v in view_2.items():
+            #    base_dict[f"{k}_v2"] = v
+
+        else:
+            # 평가 시 셔플링 없이 단일 View 생성 (기존 로직과 동일)
+            indices = list(range(len(seq_raw)))
+            view_eval = self._get_view_features(u_mapped_id, indices, seq_mapped, time_buckets, session_ids_raw, self.processor.u_dyn_time[u_mapped_id])
+            for k, v in view_eval.items():
+                base_dict[k] = v
+
+        return base_dict
+

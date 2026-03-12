@@ -124,6 +124,7 @@ class FeatureProcessor_v3:
             ]).astype(np.int8)
             
             self.u_dyn_conts[uidx] = np.column_stack([
+                row['price'],     
                 row['asof_price_std_scaled'], row['asof_last_price_diff_scaled'],
                 row['asof_repurchase_ratio_scaled'], row['asof_weekend_ratio_scaled']
             ]).astype(np.float16)
@@ -405,7 +406,6 @@ class SASRecDataset_v3_obsolete(Dataset):
         d_conts = self.processor.u_dyn_conts[u_mapped_id][shuffled_indices]     # [len, 4]
         d_cats = self.processor.u_dyn_cats[u_mapped_id][shuffled_indices]       # [len, 1]
         d_time = self.processor.u_dyn_time[u_mapped_id][shuffled_indices]       # [len, 2]
-
         input_dates = d_time[:, 0].tolist()
         
         if self.is_train:
@@ -439,7 +439,7 @@ class SASRecDataset_v3_obsolete(Dataset):
         # 8. 동적 피처 패딩 처리
         # 0으로 채워진 패딩 행렬 생성
         pad_b = np.zeros((pad_len, 3), dtype=np.int64)
-        pad_c = np.zeros((pad_len, 4), dtype=np.float32)
+        pad_c = np.zeros((pad_len, 5), dtype=np.float32)
         pad_cat = np.zeros((pad_len, 1), dtype=np.int64)
         pad_1d = np.zeros(pad_len, dtype=np.int64)
 
@@ -497,236 +497,6 @@ import numpy as np
 import pandas as pd
 import random
 
-class SASRecDataset_v3(Dataset):
-    def __init__(self, processor, global_now_str="2020-09-22", max_len=30, is_train=True):
-        self.processor = processor
-        self.max_len = max_len
-        self.is_train = is_train
-        self.user_ids = processor.user_ids
-        
-        global_now_dt = pd.to_datetime(global_now_str)
-        self.now_ordinal = global_now_dt.toordinal()
-        self.now_week = global_now_dt.isocalendar().week
-
-        if self.is_train: 
-            self.verify_session_logic()
-            
-    def verify_session_logic(self):
-        """디버깅용: 세션 분리 및 셔플링이 정상적으로 작동하는지 1명의 유저를 뽑아 콘솔에 출력합니다."""
-        print("\n" + "="*75)
-        print("🕵️‍♂️ [Dataset Monitor] Session Grouping & Shuffling Verification")
-        print("="*75)
-        
-        sample_user = None
-        for uid in self.user_ids:
-            u_mapped_id = self.processor.user2id.get(uid, 0)
-            if len(self.processor.u_seqs[u_mapped_id]) > 5:
-                sample_user = uid
-                break
-                
-        if not sample_user:
-            print("충분한 시퀀스를 가진 유저가 없습니다.")
-            return
-            
-        u_mapped_id = self.processor.user2id[sample_user]
-        seq_raw = self.processor.u_seqs[u_mapped_id]
-        time_deltas_raw = self.processor.u_deltas[u_mapped_id]
-        
-        session_ids_raw = [1]
-        for i in range(1, len(seq_raw)):
-            if time_deltas_raw[i] == time_deltas_raw[i-1]:
-                session_ids_raw.append(session_ids_raw[-1])
-            else:
-                session_ids_raw.append(session_ids_raw[-1] + 1)
-                
-        input_indices = list(range(len(seq_raw)))
-        grouped_indices = []
-        current_group = [input_indices[0]]
-        for i in range(1, len(input_indices)):
-            if time_deltas_raw[input_indices[i]] == time_deltas_raw[input_indices[i-1]]:
-                current_group.append(input_indices[i])
-            else:
-                grouped_indices.append(current_group)
-                current_group = [input_indices[i]]
-        if current_group: grouped_indices.append(current_group)
-        
-        shuffled_indices = []
-        for group in grouped_indices:
-            group_copy = group.copy()
-            if len(group_copy) > 1:
-                random.shuffle(group_copy) 
-            shuffled_indices.extend(group_copy)
-            
-        print(f"👤 Sample User ID: {sample_user}")
-        print(f"{'Orig_Idx':<9} | {'Item_ID':<11} | {'Delta (Days)':<13} | {'Session_ID':<11} | {'Shuffled_Idx':<13}")
-        print("-" * 75)
-        
-        for i in range(len(seq_raw)):
-            orig_idx = i
-            shuff_idx = shuffled_indices[i] 
-            item_id = seq_raw[shuff_idx]
-            delta = time_deltas_raw[shuff_idx]
-            sess_id = session_ids_raw[shuff_idx]
-            print(f"{orig_idx:<9} | {item_id:<11} | {delta:<13} | {sess_id:<11} | {shuff_idx:<13}")
-        print("="*75 + "\n")
-
-    def _shuffle_indices_within_session(self, indices, time_deltas_raw):
-        if len(indices) <= 1: return indices
-        grouped_indices = []
-        current_group = [indices[0]]
-        
-        for i in range(1, len(indices)):
-            idx = indices[i]
-            prev_idx = indices[i-1] 
-            
-            if time_deltas_raw[idx] == time_deltas_raw[prev_idx]:
-                current_group.append(idx)
-            else:
-                grouped_indices.append(current_group)
-                current_group = [idx]
-                
-        if current_group: grouped_indices.append(current_group)
-        
-        shuffled_indices = []
-        for group in grouped_indices:
-            if len(group) > 1 and random.random() < 0.5:
-                random.shuffle(group)
-            shuffled_indices.extend(group)
-        return shuffled_indices
-
-    def __len__(self):
-        return len(self.user_ids)
-
-    def _get_view_features(self, u_mapped_id, indices, seq_mapped, time_buckets, session_ids_raw, d_time_full):
-        """💡 단일 View에 대한 슬라이싱 및 패딩을 수행하여 딕셔너리로 반환하는 헬퍼 함수"""
-        indices = indices[-self.max_len:]
-        pad_len = self.max_len - len(indices)
-        
-        input_seq = [seq_mapped[i] for i in indices]
-        input_time = [time_buckets[i] for i in indices]
-        input_session = [session_ids_raw[i] for i in indices]
-        
-        d_buckets = self.processor.u_dyn_buckets[u_mapped_id][indices] 
-        d_conts = self.processor.u_dyn_conts[u_mapped_id][indices]    
-        d_cats = self.processor.u_dyn_cats[u_mapped_id][indices]      
-        d_time = self.processor.u_dyn_time[u_mapped_id][indices]      
-
-        input_dates = d_time[:, 0].tolist()
-        current_weeks = d_time[:, 1]
-        
-        if self.is_train:
-            target_seq = [seq_mapped[i + 1] for i in indices]
-            target_indices = [idx + 1 for idx in indices]
-            step_target_times = self.processor.u_dyn_time[u_mapped_id][target_indices, 0]
-            step_target_weeks = self.processor.u_dyn_time[u_mapped_id][target_indices, 1] 
-            dynamic_offsets = np.clip(step_target_times - d_time[:, 0], 0, 365).astype(np.int64)
-        else:
-            target_seq = []
-            dynamic_offsets = np.clip(self.now_ordinal - d_time[:, 0], 0, 365).astype(np.int64)
-            step_target_weeks = np.array([self.now_week] * len(indices))
-
-        # 패딩 처리
-        input_padded = [0] * pad_len + input_seq
-        time_padded = [0] * pad_len + input_time
-        target_padded = [0] * pad_len + target_seq if self.is_train else [0] * self.max_len
-        padding_mask = [True] * pad_len + [False] * len(input_seq)
-        session_padded = [0] * pad_len + input_session
-        target_week_padded = [0] * pad_len + step_target_weeks.tolist()
-        dates_padded = [0] * pad_len + input_dates
-        
-        # 아이템 사이드 정보
-        item_side_info = self.processor.i_side_arr[input_padded]
-        
-        # 동적 피처 패딩
-        pad_b = np.zeros((pad_len, 3), dtype=np.int64)
-        pad_c = np.zeros((pad_len, 4), dtype=np.float32)
-        pad_cat = np.zeros((pad_len, 1), dtype=np.int64)
-        pad_1d = np.zeros(pad_len, dtype=np.int64)
-
-        d_buckets_p = np.vstack([pad_b, d_buckets]) if len(indices) > 0 else pad_b
-        d_conts_p = np.vstack([pad_c, d_conts]) if len(indices) > 0 else pad_c
-        d_cats_p = np.vstack([pad_cat, d_cats]) if len(indices) > 0 else pad_cat
-        offset_p = np.concatenate([pad_1d, dynamic_offsets]) if len(indices) > 0 else pad_1d
-        week_p = np.concatenate([pad_1d, current_weeks]) if len(indices) > 0 else pad_1d
-
-        return {
-            'item_ids': torch.tensor(input_padded, dtype=torch.long),
-            'target_ids': torch.tensor(target_padded, dtype=torch.long),
-            'padding_mask': torch.tensor(padding_mask, dtype=torch.bool),
-            'time_bucket_ids': torch.tensor(time_padded, dtype=torch.long),
-            'session_ids': torch.tensor(session_padded, dtype=torch.long),
-            'type_ids': torch.tensor(item_side_info[:, 0], dtype=torch.long),
-            'color_ids': torch.tensor(item_side_info[:, 1], dtype=torch.long),
-            'graphic_ids': torch.tensor(item_side_info[:, 2], dtype=torch.long),
-            'section_ids': torch.tensor(item_side_info[:, 3], dtype=torch.long),
-            'price_bucket': torch.tensor(d_buckets_p[:, 0], dtype=torch.long),
-            'cnt_bucket': torch.tensor(d_buckets_p[:, 1], dtype=torch.long),
-            'recency_bucket': torch.tensor(d_buckets_p[:, 2], dtype=torch.long),
-            'cont_feats': torch.tensor(d_conts_p, dtype=torch.float32),
-            'channel_ids': torch.tensor(d_cats_p[:, 0], dtype=torch.long),
-            'recency_offset': torch.tensor(offset_p, dtype=torch.long),
-            'current_week': torch.tensor(week_p, dtype=torch.long),
-            'target_week': torch.tensor(target_week_padded, dtype=torch.long),
-            'interaction_dates': torch.tensor(dates_padded, dtype=torch.long),
-        }
-
-    def __getitem__(self, idx):
-        user_id = self.user_ids[idx]
-        u_mapped_id = self.processor.user2id.get(user_id, 0)
-        
-        seq_raw = self.processor.u_seqs[u_mapped_id]
-        time_deltas_raw = self.processor.u_deltas[u_mapped_id]
-        
-        session_ids_raw = [1]
-        for i in range(1, len(seq_raw)):
-            if time_deltas_raw[i] == time_deltas_raw[i-1]:
-                session_ids_raw.append(session_ids_raw[-1]) 
-            else:
-                session_ids_raw.append(session_ids_raw[-1] + 1)
-        
-        seq_mapped = [self.processor.item2id.get(iid, 0) for iid in seq_raw]
-        bins = np.array([0, 3, 7, 14, 30, 60, 180, 330, 395])
-        time_buckets = np.digitize(time_deltas_raw, bins, right=False).tolist()
-
-        # 정적 피처는 View 분리와 상관없이 공통입니다.
-        s_buckets = self.processor.u_static_buckets[u_mapped_id]
-        s_cats = self.processor.u_static_cats[u_mapped_id]
-        
-        base_dict = {
-            'user_ids': user_id,
-            'age_bucket': torch.tensor(s_buckets[0], dtype=torch.long),
-            'club_status_ids': torch.tensor(s_cats[0], dtype=torch.long),
-            'news_freq_ids': torch.tensor(s_cats[1], dtype=torch.long),
-            'fn_ids': torch.tensor(s_cats[2], dtype=torch.long),
-            'active_ids': torch.tensor(s_cats[3], dtype=torch.long),
-        }
-
-        if self.is_train:
-            # 💡 [핵심] 훈련 시 두 번의 독립적인 셔플링 수행
-            input_indices = list(range(len(seq_raw) - 1))
-            indices_v1 = self._shuffle_indices_within_session(input_indices, time_deltas_raw)
-            #indices_v2 = self._shuffle_indices_within_session(input_indices, time_deltas_raw)
-            
-            # View 1 생성 및 병합 (_v1)
-            view_1 = self._get_view_features(u_mapped_id, indices_v1, seq_mapped, time_buckets, session_ids_raw, self.processor.u_dyn_time[u_mapped_id])
-            for k, v in view_1.items():
-                base_dict[f"{k}_v1"] = v
-                
-            # View 2 생성 및 병합 (_v2)
-            #view_2 = self._get_view_features(u_mapped_id, indices_v2, seq_mapped, time_buckets, session_ids_raw, self.processor.u_dyn_time[u_mapped_id])
-            #for k, v in view_2.items():
-            #    base_dict[f"{k}_v2"] = v
-
-        else:
-            # 평가 시 셔플링 없이 단일 View 생성 (기존 로직과 동일)
-            indices = list(range(len(seq_raw)))
-            view_eval = self._get_view_features(u_mapped_id, indices, seq_mapped, time_buckets, session_ids_raw, self.processor.u_dyn_time[u_mapped_id])
-            for k, v in view_eval.items():
-                base_dict[k] = v
-
-        return base_dict
-
-
 
 
 class ContinuousFeatureTokenizer_v3(nn.Module):
@@ -762,7 +532,7 @@ class ContinuousFeatureTokenizer_v3(nn.Module):
         return tokenized_x
 
 
-class SASRecUserTower_v3(nn.Module):
+class SASRecUserTower_v3_prev(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.d_model = args.d_model
@@ -848,12 +618,7 @@ class SASRecUserTower_v3(nn.Module):
             nn.Dropout(self.dropout_rate)
         )
 
-        self.output_proj = nn.Sequential(
-            nn.Linear(self.d_model * 3, self.d_model),
-            nn.LayerNorm(self.d_model),
-            nn.GELU(),
-            nn.Linear(self.d_model, self.d_model)
-        )
+
         
         self.apply(self._init_weights)
         
@@ -1078,6 +843,367 @@ class SASRecUserTower_v3(nn.Module):
                 t_week_intent = target_week_vec[:, -1, :]
                 final_vec = final_vec + t_week_intent
             return F.normalize(final_vec, p=2, dim=-1) 
+        
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ================================================================
+# StreamFusionGate (SENet 스타일 차원별 융합)
+# ================================================================
+class StreamFusionGate(nn.Module):
+    """
+    두 스트림(seq, static)을 차원별로 융합
+    스칼라 softmax 대비: d_model 각 차원마다 독립적 중요도 학습
+    """
+    def __init__(self, d_model, reduction=4):
+        super().__init__()
+        self.d_model = d_model
+        self.se = nn.Sequential(
+            nn.Linear(d_model, d_model // reduction),    # squeeze
+            nn.LayerNorm(d_model // reduction),
+            nn.ReLU(),
+            nn.Linear(d_model // reduction, d_model * 2),  # excite (두 스트림)
+            nn.Sigmoid()
+        )
+
+    def forward(self, h_seq, h_static):
+        """
+        h_seq, h_static: (B, S, D) or (B, 1, D)
+        returns: (B, S, D)
+        """
+        combined = h_seq + h_static                        # (B, S, D)
+        gate     = self.se(combined)                       # (B, S, D*2)
+        g_seq    = gate[:, :, :self.d_model]               # (B, S, D)
+        g_static = gate[:, :, self.d_model:]               # (B, S, D)
+        return g_seq * h_seq + g_static * h_static         # (B, S, D)
+
+
+# ================================================================
+# ContinuousFeatureMLP
+# asof 4개 피처를 함께 투영하여 피처 간 상호작용 학습
+# 기존 ContinuousFeatureTokenizer(독립 투영) 대체
+# ================================================================
+class ContinuousFeatureMLP(nn.Module):
+    """
+    asof 연속 피처 4개(price_std, last_price_diff, repurchase, weekend)
+    → MLP로 상호작용 학습 → d_model
+    """
+    def __init__(self, num_asof_feats: int, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(num_asof_feats, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        """
+        x: (B, S, num_asof_feats)
+        returns: (B, S, d_model)
+        """
+        return self.mlp(x)
+
+
+# ================================================================
+# SASRecUserTower_v4
+# ================================================================
+class SASRecUserTower_v3(nn.Module):
+    """
+    변경 사항 요약:
+      [제거]
+        - feature_transformer (type/color/graphic/section 노이즈)
+        - ContinuousFeatureTokenizer → ContinuousFeatureMLP로 교체
+        - seq_gate[0~3] sigmoid gate → 컴포넌트별 LayerNorm으로 대체
+        - static_gate[0~5] sigmoid gate → static_mlp weight가 중요도 직접 학습
+        - feat_proj, fusion_gate(Linear)
+
+      [추가]
+        - price_item_proj: 개별 아이템 가격 → item_emb 직접 주입
+        - ln_pretrained / ln_item_id / ln_price: 컴포넌트별 LayerNorm
+        - ContinuousFeatureMLP: asof 4개 상호작용 학습
+        - StreamFusionGate: SENet 차원별 융합
+        - seq_gate[4] (target_week): 유일하게 유지 (최종 output injection)
+    """
+    def __init__(self, args):
+        super().__init__()
+        self.d_model      = args.d_model
+        self.max_len      = args.max_len
+        self.dropout_rate = args.dropout
+
+        # ── [1] Item Stream ──────────────────────────────────────
+        self.item_proj       = nn.Linear(args.pretrained_dim, self.d_model)
+        self.item_id_emb     = nn.Embedding(args.num_items + 1, self.d_model, padding_idx=0)
+        self.price_item_proj = nn.Linear(1, self.d_model)   # 개별 가격 전용
+        self.pos_emb         = nn.Embedding(self.max_len, self.d_model)
+
+        # 컴포넌트별 LayerNorm (스케일 균형)
+        # sigmoid gate 대신 각 컴포넌트가 동일 스케일로 합산되도록 보장
+        self.ln_pretrained = nn.LayerNorm(self.d_model)
+        self.ln_item_id    = nn.LayerNorm(self.d_model)
+        self.ln_price      = nn.LayerNorm(self.d_model)
+
+        # Global context (recency + week)
+        self.recency_proj = nn.Linear(1, self.d_model)
+        self.week_proj    = nn.Linear(2, self.d_model)
+        self.global_ln    = nn.LayerNorm(self.d_model)
+
+        # item_emb 최종 정규화 + dropout
+        self.emb_ln_item      = nn.LayerNorm(self.d_model)
+        self.emb_dropout_item = nn.Dropout(self.dropout_rate)
+
+        # Item Transformer (2층, nhead)
+        item_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=args.nhead,
+            dim_feedforward=self.d_model,
+            dropout=self.dropout_rate,
+            activation='gelu',
+            norm_first=True,
+            batch_first=True
+        )
+        self.item_transformer = nn.TransformerEncoder(
+            item_layer, num_layers=args.num_layers
+        )
+
+        # ── [2] Static Stream ────────────────────────────────────
+        mid_dim, low_dim = 16, 4
+
+        # 이산 피처 Embedding (gate 제거 → Embedding weight 자체가 중요도 학습)
+        self.age_emb         = nn.Embedding(11, mid_dim, padding_idx=0)
+        self.channel_emb     = nn.Embedding(4,  low_dim, padding_idx=0)
+        self.club_status_emb = nn.Embedding(4,  low_dim, padding_idx=0)
+        self.news_freq_emb   = nn.Embedding(3,  low_dim, padding_idx=0)
+        self.fn_emb          = nn.Embedding(3,  low_dim, padding_idx=0)
+        self.active_emb      = nn.Embedding(3,  low_dim, padding_idx=0)
+
+        # asof 연속 피처 MLP (gate 제거 → MLP weight가 중요도 학습)
+        # cont_feats index: 0=price(item_emb용), 1~4=asof 4개
+        num_asof = 4
+        self.cont_mlp = ContinuousFeatureMLP(
+            num_asof_feats=num_asof,
+            d_model=32,
+            dropout=self.dropout_rate
+        )
+
+        # static_mlp 입력 차원
+        # age(16) + chan(4) + club(4) + news(4) + fn(4) + act(4) + cont_mlp(d_model)
+        cont_out_dim = 32  # cont_mlp d_model과 동일하게
+        static_input_dim = mid_dim + low_dim * 5 + cont_out_dim  # 36 + 32 = 68
+
+        self.static_mlp = nn.Sequential(
+            nn.Linear(static_input_dim, self.d_model),
+            nn.LayerNorm(self.d_model),
+            nn.GELU(),
+            nn.Dropout(self.dropout_rate)
+        )
+
+        # ── [3] Fusion ───────────────────────────────────────────
+        self.seq_proj    = nn.Linear(self.d_model, self.d_model)
+        self.static_proj = nn.Linear(self.d_model, self.d_model)
+
+        # SENet 차원별 융합 (스칼라 softmax 대체)
+        self.fusion_gate = StreamFusionGate(self.d_model, reduction=4)
+
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.GELU(),
+            nn.Linear(self.d_model, self.d_model)
+        )
+
+        # ── [4] target_week gate (유일하게 유지) ─────────────────
+        # 최종 output에 additive injection → 스케일 조절이 실질적으로 의미 있음
+        self.target_week_gate = nn.Parameter(torch.ones(1))
+
+        # 가중치 초기화
+        self.apply(self._init_weights)
+
+        # week/recency xavier 재초기화 (apply 이후 덮어쓰기)
+        nn.init.xavier_normal_(self.week_proj.weight)
+        nn.init.xavier_normal_(self.recency_proj.weight)
+        nn.init.constant_(self.week_proj.bias, 0)
+        nn.init.constant_(self.recency_proj.bias, 0)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    def get_causal_mask(self, seq_len, device):
+        return torch.triu(
+            torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+            diagonal=1
+        )
+
+    def _build_week_vec(self, week_tensor):
+        """week 텐서(B,S) → cyclical 투영 (B,S,D)"""
+        week_rad = (week_tensor.float() / 52.0) * (2 * math.pi)
+        week_cyclical = torch.cat([
+            torch.sin(week_rad).unsqueeze(-1),
+            torch.cos(week_rad).unsqueeze(-1)
+        ], dim=-1)                             # (B, S, 2)
+        return self.week_proj(week_cyclical)   # (B, S, D)
+
+    def forward(self,
+                pretrained_vecs, item_ids, time_bucket_ids,
+                type_ids, color_ids, graphic_ids, section_ids,
+                age_bucket, price_bucket, cnt_bucket, recency_bucket,
+                channel_ids, club_status_ids, news_freq_ids, fn_ids, active_ids,
+                cont_feats,
+                recency_offset, current_week, session_ids, target_week=None,
+                padding_mask=None, training_mode=True):
+
+        device     = item_ids.device
+        seq_len    = item_ids.size(1)
+        batch_size = item_ids.size(0)
+
+        # ── position / causal mask ────────────────────────────────
+        #positions      = torch.arange(seq_len, device=device).unsqueeze(0)
+        #pos_embeddings = self.pos_emb(positions)                    # (1, S, D)
+        #causal_mask    = self.get_causal_mask(seq_len, device)
+        prev_session_ids = torch.cat([
+            torch.zeros_like(session_ids[:, :1]), 
+            session_ids[:, :-1]
+        ], dim=1)
+        
+        # 2. session_id가 변경된 지점을 감지 (변경되었으면 1, 같으면 0)
+        is_session_change = (session_ids != prev_session_ids).long()
+        
+        # 3. 누적합(cumsum)을 통해 세션별 고유 포지션 인덱스 생성
+        # 예: session_ids = [10, 10, 12, 12] -> is_change = [1, 0, 1, 0] -> positions = [1, 1, 2, 2]
+        positions = torch.cumsum(is_session_change, dim=1)
+        
+        # 4. 패딩 토큰 위치는 포지션 인덱스 0으로 마스킹 초기화
+        positions = positions.masked_fill(padding_mask, 0)
+        
+        # 5. 최대 max_len을 초과하지 않도록 안전장치(clamp) 적용 후 임베딩 통과
+        positions = positions.clamp(max=self.max_len - 1)
+        pos_embeddings = self.pos_emb(positions)  # 결과 shape: (B, S, D)
+
+        causal_mask = self.get_causal_mask(seq_len, device)
+
+
+        # ── static 이산 피처 시퀀스 차원 확장 ────────────────────
+        age_bucket      = age_bucket.unsqueeze(1).expand(-1, seq_len)
+        club_status_ids = club_status_ids.unsqueeze(1).expand(-1, seq_len)
+        news_freq_ids   = news_freq_ids.unsqueeze(1).expand(-1, seq_len)
+        fn_ids          = fn_ids.unsqueeze(1).expand(-1, seq_len)
+        active_ids      = active_ids.unsqueeze(1).expand(-1, seq_len)
+
+        # ════════════════════════════════════════════════════════════
+        # Phase 1: Global Context (recency + week)
+        # ════════════════════════════════════════════════════════════
+        recency_scaled = (recency_offset.float() / 365.0).unsqueeze(-1)  # (B,S,1)
+        r_offset_vec   = self.recency_proj(recency_scaled)                # (B,S,D)
+        w_vec          = self._build_week_vec(current_week)               # (B,S,D)
+
+        # global_context: 두 벡터 합산 후 LayerNorm
+        # (게이트 제거: global_ln이 스케일 균형 담당)
+        global_context = self.global_ln(r_offset_vec + w_vec)            # (B,S,D)
+
+        # ════════════════════════════════════════════════════════════
+        # Phase 2: Item Stream
+        # 각 컴포넌트 독립 LayerNorm → 동일 스케일 합산
+        # sigmoid gate 제거: LayerNorm이 스케일 균형 보장
+        # ════════════════════════════════════════════════════════════
+        comp_pretrained = self.ln_pretrained(self.item_proj(pretrained_vecs))
+        comp_item_id    = self.ln_item_id(self.item_id_emb(item_ids))
+
+        item_price      = cont_feats[:, :, 0:1]                           # (B,S,1)
+        comp_price      = self.ln_price(self.price_item_proj(item_price)) # (B,S,D)
+
+        # 합산: pretrained + item_id + price + position + global_context
+        item_emb = (
+            comp_pretrained
+            + comp_item_id
+            + comp_price
+            + pos_embeddings
+            + global_context
+        )
+
+        item_emb = self.emb_ln_item(item_emb)
+        item_emb = self.emb_dropout_item(item_emb)
+
+        item_output = self.item_transformer(
+            item_emb,
+            mask=causal_mask,
+            src_key_padding_mask=padding_mask
+        )                                                                  # (B,S,D)
+
+        # ════════════════════════════════════════════════════════════
+        # Phase 3: Static Stream
+        # gate 제거: Embedding weight + static_mlp weight가 중요도 직접 학습
+        # ════════════════════════════════════════════════════════════
+        emb_age  = self.age_emb(age_bucket)                               # (B,S,16)
+        emb_chan = self.channel_emb(channel_ids)                          # (B,S,4)
+        emb_club = self.club_status_emb(club_status_ids)                  # (B,S,4)
+        emb_news = self.news_freq_emb(news_freq_ids)                      # (B,S,4)
+        emb_fn   = self.fn_emb(fn_ids)                                    # (B,S,4)
+        emb_act  = self.active_emb(active_ids)                            # (B,S,4)
+
+        # asof 4개 MLP (price 제외, index 1~4)
+        asof_feats = cont_feats[:, :, 1:]                                 # (B,S,4)
+        cont_vec   = self.cont_mlp(asof_feats)                            # (B,S,D)
+
+        static_input = torch.cat([
+            emb_age, emb_chan, emb_club,
+            emb_news, emb_fn, emb_act,
+            cont_vec
+        ], dim=-1)                              # (B,S, 16+4*5+D = 36+D)
+
+        user_profile_vec = self.static_mlp(static_input)                  # (B,S,D)
+
+        # ════════════════════════════════════════════════════════════
+        # Phase 4: target_week 벡터 (gate 유지)
+        # 최종 output에 직접 더해지므로 스케일 조절 의미 있음
+        # ════════════════════════════════════════════════════════════
+        if target_week is not None:
+            target_week_vec = (
+                self._build_week_vec(target_week)
+                * torch.sigmoid(self.target_week_gate)
+            )                                                              # (B,S,D)
+
+        # ════════════════════════════════════════════════════════════
+        # Phase 5: SENet Fusion
+        # ════════════════════════════════════════════════════════════
+        if training_mode:
+            h_seq    = self.seq_proj(item_output)                         # (B,S,D)
+            h_static = self.static_proj(user_profile_vec)                 # (B,S,D)
+
+            # StreamFusionGate: 차원별 중요도로 두 스트림 융합
+            fused     = self.fusion_gate(h_seq, h_static)                 # (B,S,D)
+            final_vec = self.output_proj(fused)                           # (B,S,D)
+
+            if target_week is not None:
+                final_vec = final_vec + target_week_vec
+
+            return F.normalize(final_vec, p=2, dim=-1)
+
+        else:
+            # 추론: 마지막 스텝만 사용
+            h_seq    = self.seq_proj(item_output[:, -1:, :])              # (B,1,D)
+            h_static = self.static_proj(user_profile_vec[:, -1:, :])     # (B,1,D)
+
+            fused     = self.fusion_gate(h_seq, h_static)                 # (B,1,D)
+            final_vec = self.output_proj(fused).squeeze(1)                # (B,D)
+
+            if target_week is not None:
+                final_vec = final_vec + target_week_vec[:, -1, :]
+
+            return F.normalize(final_vec, p=2, dim=-1)
+
+
+
 
         
 import json
@@ -1214,358 +1340,6 @@ def mine_global_hard_negatives(item_embs, exclusion_top_k=50, mine_k=5, batch_si
 import torch
 import torch.nn.functional as F
 
-def inbatch_corrected_logq_loss_with_hybrid_hard_neg_prev(
-    user_emb, seq_item_emb, target_ids, user_ids, log_q_tensor,
-    hn_item_emb=None, batch_hard_neg_ids=None,
-    flat_history_item_ids=None,
-    step_weights=None,
-    temperature=0.1, 
-    lambda_logq=1.0,          
-    alpha=1.0,                
-    margin=0.00,
-    soft_penalty_weight=5.0,
-    return_metrics=False     
-):
-    N = user_emb.size(0)
-    device = user_emb.device
-    SAFE_NEG_INF = -1e9
-    
-    # 💡 [추가] Metrics 계산을 위해 step_weights 사전 처리
-    if step_weights is not None:
-        step_weights = torch.as_tensor(step_weights, device=device, dtype=torch.float32)
-        weight_sum = step_weights.sum() + 1e-9
-        sw_unsqueezed = step_weights.unsqueeze(1) # [N, 1] 형태 (브로드캐스팅용)
-    else:
-        weight_sum = None
-        sw_unsqueezed = None
-
-    # -----------------------------------------------------------
-    # 1. In-batch Logits 계산
-    # -----------------------------------------------------------
-    sim_matrix = torch.matmul(user_emb, seq_item_emb.T) 
-    pos_sim = torch.diagonal(sim_matrix) # [N]
-    labels = torch.arange(N, device=device)
-    logits = sim_matrix / temperature
-
-    if margin > 0.0:
-        logits[labels, labels] -= (margin / temperature)
-
-    if lambda_logq > 0.0:
-        batch_log_q = log_q_tensor[target_ids]
-        logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
-
-    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
-    same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
-    same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
-    false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
-    logits = logits.masked_fill(false_neg_mask, SAFE_NEG_INF)
-    
-    metrics = {}
-    
-    # -----------------------------------------------------------
-    # 2. Hard Negative Processing
-    # -----------------------------------------------------------
-    if hn_item_emb is not None and batch_hard_neg_ids is not None:
-
-        #if batch_hard_neg_ids.size(1) > num_hn_to_use:
-        #    rand_indices = torch.randperm(batch_hard_neg_ids.size(1), device=device)[:num_hn_to_use]
-        #    batch_hard_neg_ids = batch_hard_neg_ids[:, rand_indices]
-        #    hn_item_emb = hn_item_emb[:, rand_indices, :] 
-        
-        # -------------------------------------------------------
-        # [B] 동적 Positive Boundary 기반 마스크 (Buffer Zone Semi-Hard)
-        # -------------------------------------------------------        
-        num_hn_to_use = 30
-        pool_multiplier = 3
-        num_pool = num_hn_to_use * pool_multiplier  # 90개 추출 풀
-        
-        # 💡 [핵심 도입] Buffer Zone (안전 지대)
-        # 패션 도메인 특성상, 너무 정답과 비슷해서 억울하게 네거티브로 판정될 수 있는 
-        # 최상위(Hardest) 10개는 아예 타격 풀에서 제외시켜 버립니다.
-        skip_top_k = 10 
-
-        # [STEP 1] VRAM 방어: 150개 풀에서 유사도 계산 및 필터링 (Gradient 미추적)
-        with torch.no_grad():
-            hn_item_emb_no_grad = hn_item_emb.detach() 
-            hn_sim_no_grad = torch.bmm(user_emb.unsqueeze(1), hn_item_emb_no_grad.transpose(1, 2)).squeeze(1)
-            
-            absolute_fn_mask = torch.zeros_like(hn_sim_no_grad, dtype=torch.bool, device=device)
-            if flat_history_item_ids is not None:
-                absolute_fn_mask = (batch_hard_neg_ids.unsqueeze(2) == flat_history_item_ids.unsqueeze(1)).any(dim=2)
-            
-            # (기존 유지) 0.8 비율 상한선 방어
-            boundary_ratio = 0.80
-            dynamic_boundary = pos_sim.unsqueeze(1) * boundary_ratio 
-            dynamic_fn_mask = hn_sim_no_grad >= dynamic_boundary
-            
-            final_fn_mask = absolute_fn_mask | dynamic_fn_mask
-            masked_sims_for_ranking = hn_sim_no_grad.masked_fill(final_fn_mask, -1e4)
-            
-            # 💡 [핵심 1] 100개 (90 + 10)의 인덱스를 추출합니다.
-            _, top_indices_all = torch.topk(masked_sims_for_ranking, num_pool + skip_top_k, dim=1)
-
-            # 💡 [핵심 2] 최상위 10개를 썰어내고(Slicing), 11등~100등 사이의 '안전한' Semi-Hard 풀 90개를 만듭니다.
-            top_indices_pool = top_indices_all[:, skip_top_k:]
-
-            # 💡 [핵심 3] 그 90개 중에서 30개를 무작위로 샘플링하여 획일화(과적합)를 방지합니다.
-            rand_idx = torch.rand(N, num_pool, device=device).argsort(dim=1)[:, :num_hn_to_use]
-            top_indices = torch.gather(top_indices_pool, 1, rand_idx)
-
-        # [STEP 2] 최정예 30개만 본 학습용으로 조립 (기존과 동일)
-        batch_hard_neg_ids_final = torch.gather(batch_hard_neg_ids, 1, top_indices)
-        # 임베딩 조립 [N, 60, 128] -> [N, 30, 128]
-        top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, hn_item_emb.size(2))
-        hn_item_emb_final = torch.gather(hn_item_emb, 1, top_indices_expanded).detach()
-
-        # [STEP 3] 본 학습 연산 (정상 전파)
-        # user_emb: [N, 128], hn_item_emb_final: [N, 30, 128] -> hn_sim: [N, 30]
-        hn_sim = torch.bmm(user_emb.unsqueeze(1), hn_item_emb_final.transpose(1, 2)).squeeze(1) 
-        
-        hn_logits = (hn_sim / temperature) * alpha
-        
-        if lambda_logq > 0.0:
-            # 💡 [수정 완료] 조립이 끝난 최종 30개의 ID 텐서를 인덱싱합니다.
-            hn_log_q = log_q_tensor[batch_hard_neg_ids_final] 
-            hn_logits = hn_logits - (hn_log_q * lambda_logq)
-        
-        # 💡 [Pass 안전장치] 풀(Pool)을 넉넉하게 잡느라 딸려온 -1e4짜리 가짜 네거티브들이나,
-        # 학습 도중 정답과 너무 비슷해져 버린(0.8 이상) 녀석들을 여기서 완벽하게 제거합니다.
-        final_safety_mask = hn_sim >= (pos_sim.unsqueeze(1) * boundary_ratio)
-        hn_logits = hn_logits.masked_fill(final_safety_mask, SAFE_NEG_INF)
-
-        logits = torch.cat([logits, hn_logits], dim=1)
-        
-        
-        if return_metrics:
-            if step_weights is not None:
-                # 1. FN으로 간주되어 버려진(Discarded) 하드 네거티브의 비율
-                metrics['hn/discarded_ratio'] = ((dynamic_fn_mask.float().mean(dim=1) * step_weights).sum() / weight_sum).item()
-                
-                # 2. 살아남은 '진짜' Hard Negative들의 평균 유사도 계산
-                valid_hn_mask = ~final_safety_mask
-                valid_hn_sim = hn_sim[valid_hn_mask]
-                
-                # sw_unsqueezed는 이전 리팩토링에서 만든 step_weights.unsqueeze(1)
-                valid_weights = sw_unsqueezed.expand_as(hn_sim)[valid_hn_mask] 
-                
-                if valid_weights.sum() > 0:
-                    metrics['sim/hn_true_hard'] = ((valid_hn_sim * valid_weights).sum() / valid_weights.sum()).item()
-                else:
-                    metrics['sim/hn_true_hard'] = 0.0
-            else:
-                metrics['hn/discarded_ratio'] = dynamic_fn_mask.float().mean().item()
-                valid_hn_sim = hn_sim[~final_safety_mask]
-                metrics['sim/hn_true_hard'] = valid_hn_sim.mean().item() if valid_hn_sim.numel() > 0 else 0.0
-        
-    logits = torch.clamp(logits, min=SAFE_NEG_INF, max=1e4)
-
-    # -----------------------------------------------------------
-    # 3. Loss 계산
-    # -----------------------------------------------------------
-    if step_weights is not None:
-        loss_unreduced = F.cross_entropy(logits, labels, reduction='none')
-        loss = (loss_unreduced * step_weights).sum() / (weight_sum + 1e-9)
-        
-        if return_metrics:
-            metrics['sim/pos'] = ((pos_sim * step_weights).sum() / weight_sum).item()
-    else:
-        loss = F.cross_entropy(logits, labels)
-        if return_metrics:
-            metrics['sim/pos'] = pos_sim.mean().item()
-
-    # -----------------------------------------------------------
-    # 4. Probabilities Metrics
-    # -----------------------------------------------------------
-    if return_metrics:
-        with torch.no_grad():
-            probs = F.softmax(logits, dim=1)
-            if batch_hard_neg_ids is not None:
-                hn_probs_sum = probs[:, N:].sum(dim=1) # [N]
-                neg_probs_total = 1.0 - probs.diagonal() # [N]
-                relative_hn_ratio = hn_probs_sum / (neg_probs_total + 1e-9) # [N]
-                
-                # 💡 [핵심 변경] 확률 지표에도 가중 평균 적용
-                if step_weights is not None:
-                    metrics['hn/influence_ratio'] = ((hn_probs_sum * step_weights).sum() / weight_sum).item()
-                    metrics['hn/relative_influence'] = ((relative_hn_ratio * step_weights).sum() / weight_sum).item()
-                else:
-                    metrics['hn/influence_ratio'] = hn_probs_sum.mean().item()
-                    metrics['hn/relative_influence'] = relative_hn_ratio.mean().item()
-            else:
-                metrics['hn/influence_ratio'] = 0.0
-                metrics['hn/relative_influence'] = 0.0
-
-        return loss, metrics
-
-    return loss
-
-
-def inbatch_corrected_logq_loss_with_hybrid_hard_neg_prev2(
-    user_emb, seq_item_emb, target_ids, user_ids, log_q_tensor,
-    hn_item_emb=None, batch_hard_neg_ids=None,
-    flat_history_item_ids=None,
-    step_weights=None,
-    # final_idx=None, 💡 [삭제] 더 이상 부분 연산이 필요 없습니다.
-    temperature=0.07, # 💡 [수정] 낮춘 온도 적용
-    lambda_logq=1.0,          
-    alpha=1.0,                
-    margin=0.00,
-    soft_penalty_weight=5.0,
-    return_metrics=False     
-):
-    N = user_emb.size(0)
-    device = user_emb.device
-    SAFE_NEG_INF = -1e9
-    final_idx=None
-    # 가중치 텐서 준비
-    if step_weights is not None:
-        step_weights = torch.as_tensor(step_weights, device=device, dtype=torch.float32)
-        weight_sum = step_weights.sum() + 1e-9
-    else:
-        weight_sum = None
-
-    # -----------------------------------------------------------
-    # 1. In-batch Logits 계산 (전체 N개 스텝 대상)
-    # -----------------------------------------------------------
-    sim_matrix = torch.matmul(user_emb, seq_item_emb.T) 
-    pos_sim = torch.diagonal(sim_matrix) # [N]
-    labels = torch.arange(N, device=device)
-    logits = sim_matrix / temperature
-
-    if margin > 0.0:
-        logits[labels, labels] -= (margin / temperature)
-
-    if lambda_logq > 0.0:
-        batch_log_q = log_q_tensor[target_ids]
-        logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
-
-    # In-batch 내 가짜 네거티브(False Negative) 마스킹
-    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
-    same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
-    same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
-    false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
-    logits = logits.masked_fill(false_neg_mask, SAFE_NEG_INF)
-    
-    metrics = {}
-    
-    # -----------------------------------------------------------
-    # 2. Hard Negative Processing (💡 전체 N개에 대해 동시 다발적 연산!)
-    # -----------------------------------------------------------
-    num_hn_to_use = 50
-    
-    # 이제 batch_hard_neg_ids는 전체 N개에 대한 HNM 후보군을 모두 담고 들어옵니다.
-    if hn_item_emb is not None and batch_hard_neg_ids is not None:
-        
-        pool_multiplier = 2
-        num_pool = num_hn_to_use * pool_multiplier  
-        skip_top_k = 1
-
-        # [STEP 1] 기울기(Gradient) 추적 없이 후보군 필터링
-        with torch.no_grad():
-            hn_emb_no_grad = hn_item_emb
-            # 💡 [핵심] user_emb [N, D]와 hn_emb_no_grad [N, Pool, D]의 bmm 연산
-            hn_sim_no_grad = torch.bmm(user_emb.unsqueeze(1), hn_emb_no_grad.transpose(1, 2)).squeeze(1)
-            
-            absolute_fn_mask = torch.zeros_like(hn_sim_no_grad, dtype=torch.bool, device=device)
-            if flat_history_item_ids is not None:
-                absolute_fn_mask = (batch_hard_neg_ids.unsqueeze(2) == flat_history_item_ids.unsqueeze(1)).any(dim=2)
-            
-            # 💡 [최적화] 15% 불완전한 스텝을 위해 경계를 0.80 -> 0.85로 관대하게 변경
-            boundary_ratio = 0.80
-            dynamic_boundary = pos_sim.unsqueeze(1) * boundary_ratio 
-            dynamic_fn_mask = hn_sim_no_grad >= dynamic_boundary
-            
-            final_fn_mask = absolute_fn_mask | dynamic_fn_mask
-            masked_sims = hn_sim_no_grad.masked_fill(final_fn_mask, -1e4)
-            
-            _, top_idx_all = torch.topk(masked_sims, num_pool + skip_top_k, dim=1)
-            top_idx_pool = top_idx_all[:, skip_top_k:]
-
-            rand_idx = torch.rand(N, num_pool, device=device).argsort(dim=1)[:, :num_hn_to_use]
-            top_idx = torch.gather(top_idx_pool, 1, rand_idx)
-            
-
-
-        # [STEP 2] 본 학습용 임베딩 조립
-        batch_hn_ids_final = torch.gather(batch_hard_neg_ids, 1, top_idx)
-        top_idx_expanded = top_idx.unsqueeze(-1).expand(-1, -1, hn_item_emb.size(2))
-        hn_emb_final = torch.gather(hn_item_emb, 1, top_idx_expanded).detach()
-
-        # [STEP 3] 본 연산 (Gradient 흐름)
-        hn_sim = torch.bmm(user_emb.unsqueeze(1), hn_emb_final.transpose(1, 2)).squeeze(1) 
-        hn_logits = (hn_sim / temperature) * alpha
-        
-        if lambda_logq > 0.0:
-            hn_log_q = log_q_tensor[batch_hn_ids_final] 
-            hn_logits = hn_logits - (hn_log_q * lambda_logq)
-        
-        final_safety_mask = hn_sim >= (pos_sim.unsqueeze(1) * boundary_ratio)
-        hn_logits = hn_logits.masked_fill(final_safety_mask, SAFE_NEG_INF)
-
-        # 💡 [핵심 최적화] 퍼즐 조립 삭제. 바로 Cat!
-        logits = torch.cat([logits, hn_logits], dim=1)
-        
-        if return_metrics:
-            metrics['hn/discarded_ratio'] = dynamic_fn_mask.float().mean().item()
-            valid_hn_sim = hn_sim[~final_safety_mask]
-            metrics['sim/hn_true_hard'] = valid_hn_sim.mean().item() if valid_hn_sim.numel() > 0 else 0.0
-            
-        with torch.no_grad():
-                # 마스킹된 부분은 -1e9(SAFE_NEG_INF)로 채운 상태의 hn_sim 행렬 [N, num_hn]
-                masked_hn_sim = hn_sim.masked_fill(final_safety_mask, -1e4)
-                
-                # 각 유저(행)마다 살아남은 오답 중 가장 유사도가 높은 값 추출 [N]
-                max_hn_per_user, _ = masked_hn_sim.max(dim=1)
-                
-                # 살아남은 오답이 단 하나라도 있는 유저들만 필터링 (모두 잘렸으면 -1e9이므로)
-                valid_max_hn = max_hn_per_user[max_hn_per_user > -1.0]
-                
-                if valid_max_hn.numel() > 0:
-                    metrics['sim/hn_max_mean'] = valid_max_hn.mean().item()
-                else:
-                    metrics['sim/hn_max_mean'] = 0.0
-
-    else: 
-        # HNM이 비활성화되었거나 final_idx가 없을 때 (행렬 차원 유지를 위한 더미 결합)
-        hn_logits_full = torch.full((N, num_hn_to_use), SAFE_NEG_INF, device=device)
-        logits = torch.cat([logits, hn_logits_full], dim=1)
-
-    logits = torch.clamp(logits, min=SAFE_NEG_INF, max=1e4)
-
-    # -----------------------------------------------------------
-    # 3. Loss 계산 (Cross Entropy)
-    # -----------------------------------------------------------
-    if step_weights is not None:
-        loss_unreduced = F.cross_entropy(logits, labels, reduction='none')
-        loss = (loss_unreduced * step_weights).sum() / weight_sum
-        if return_metrics:
-            metrics['sim/pos'] = ((pos_sim * step_weights).sum() / weight_sum).item()
-    else:
-        loss = F.cross_entropy(logits, labels)
-        if return_metrics:
-            metrics['sim/pos'] = pos_sim.mean().item()
-
-    # -----------------------------------------------------------
-    # 4. Probabilities Metrics
-    # -----------------------------------------------------------
-    if return_metrics:
-        with torch.no_grad():
-            probs = F.softmax(logits, dim=1)
-            if hn_item_emb is not None and batch_hard_neg_ids is not None:
-                hn_probs_sum = probs[:, N:].sum(dim=1) 
-                neg_probs_total = 1.0 - probs.diagonal() 
-                relative_hn_ratio = hn_probs_sum / (neg_probs_total + 1e-9) 
-                
-                if step_weights is not None:
-                    metrics['hn/influence_ratio'] = ((hn_probs_sum * step_weights).sum() / weight_sum).item()
-                    metrics['hn/relative_influence'] = ((relative_hn_ratio * step_weights).sum() / weight_sum).item()
-                else:
-                    metrics['hn/influence_ratio'] = hn_probs_sum.mean().item()
-                    metrics['hn/relative_influence'] = relative_hn_ratio.mean().item()
-
-        return loss, metrics
-
-    return loss
 
 
 def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
@@ -1631,7 +1405,7 @@ def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
         num_pool = int(num_hn_to_use * 1.4)
         #num_pool = num_hn_to_use * pool_multiplier
         #skip_top_k = 5
-        boundary_ratio = 0.90
+        boundary_ratio = 0.85
 
         # [STEP 1] Gradient 없이 HN 후보 필터링 & 선택
         with torch.no_grad():
@@ -1807,12 +1581,12 @@ def prepare_features(cfg: PipelineConfig):
         print("   ⚠️ [Cache Miss] Cache not found. Processing from Parquet files...")
         
         # 경로 설정
-        user_path = os.path.join(cfg.base_dir, "features_user_w_meta_nonleak.parquet") 
+        user_path = os.path.join(cfg.base_dir, "features_user_w_meta_nonleak_v2.parquet") 
         item_path = os.path.join(cfg.base_dir, "features_item.parquet")
         #seq_path = os.path.join(cfg.base_dir, "features_sequence_cleaned.parquet")
         
         TARGET_VAL_PATH = os.path.join(cfg.base_dir, "features_target_val.parquet")
-        USER_VAL_FEAT_PATH = os.path.join(cfg.base_dir, "features_user_w_meta_nonleak_val.parquet")
+        USER_VAL_FEAT_PATH = os.path.join(cfg.base_dir, "features_user_w_meta_nonleak_val_v2.parquet")
         #SEQ_VAL_DATA_PATH = os.path.join(cfg.base_dir, "features_sequence_val.parquet")
         
         # Processor 초기화 
@@ -2273,7 +2047,7 @@ def evaluate_model(model, item_tower, dataloader, target_df_path, device, proces
                 'active_ids': active_ids,
                 'cont_feats': cont_feats,
                 'recency_offset': recency_offset, 'current_week': current_week, 'target_week': target_week,
-                'padding_mask': padding_mask,
+                'session_ids': session_ids, 'padding_mask': padding_mask,
                 'training_mode': False # Dropout 비활성화
             }
 
@@ -2374,774 +2148,129 @@ def evaluate_model(model, item_tower, dataloader, target_df_path, device, proces
     return results
 
 
-
-def train_user_tower_all_time(epoch, model, item_tower, log_q_tensor, dataloader, optimizer, scaler, cfg, device, hard_neg_pool_tensor, scheduler, hn_scheduler ,seq_labels=None, static_labels=None):
-    """단일 에포크 훈련 함수 (All Time Steps + Same-User Masking 적용) + Gradient Accumulation"""
-    model.train()
-    total_loss_accum = 0.0
-    main_loss_accum = 0.0
-    cl_loss_accum = 0.0
-    epoch_danger_ratio_sum = 0.0
-    num_batches = 0
-    # 💡 [핵심 1] 누적 스텝 설정 (384 * 2 = 768)
-    accumulation_steps = 1
-    force_mining_next_epoch = False
-    
-    seq_labels = seq_labels or []
-    static_labels = static_labels or []
-    
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
-    
-    # 💡 [핵심 2] 루프 시작 전, 혹시 남아있을지 모르는 이전 에포크의 그래디언트 초기화
-    #optimizer.zero_grad()
-    optimizer.zero_grad(set_to_none=True)
-    
-    for batch_idx, batch in enumerate(pbar):
-        # ❌ optimizer.zero_grad() # 매 미니배치마다 초기화하면 안 되므로 삭제!
-
-        # -------------------------------------------------------
-        # 1. Data Unpacking (기존과 동일)
-        # -------------------------------------------------------
-        item_ids = batch['item_ids'].to(device, non_blocking=True)
-        target_ids = batch['target_ids'].to(device, non_blocking=True)
-        padding_mask = batch['padding_mask'].to(device, non_blocking=True)
-        time_bucket_ids = batch['time_bucket_ids'].to(device, non_blocking=True)
-        session_ids = batch['session_ids'].to(device, non_blocking=True)
-        type_ids = batch['type_ids'].to(device, non_blocking=True)
-        color_ids = batch['color_ids'].to(device, non_blocking=True)
-        graphic_ids = batch['graphic_ids'].to(device, non_blocking=True)
-        section_ids = batch['section_ids'].to(device, non_blocking=True)
-        
-        age_bucket = batch['age_bucket'].to(device, non_blocking=True)
-        price_bucket = batch['price_bucket'].to(device, non_blocking=True)
-        cnt_bucket = batch['cnt_bucket'].to(device, non_blocking=True)
-        recency_bucket = batch['recency_bucket'].to(device, non_blocking=True)
-        
-        channel_ids = batch['channel_ids'].to(device, non_blocking=True)
-        club_status_ids = batch['club_status_ids'].to(device, non_blocking=True)
-        news_freq_ids = batch['news_freq_ids'].to(device, non_blocking=True)
-        fn_ids = batch['fn_ids'].to(device, non_blocking=True)
-        active_ids = batch['active_ids'].to(device, non_blocking=True)
-        cont_feats = batch['cont_feats'].to(device, non_blocking=True)
-        
-        recency_offset = batch['recency_offset'].to(device, non_blocking=True)
-        current_week = batch['current_week'].to(device, non_blocking=True)
-        target_week = batch['target_week'].to(device, non_blocking=True)
-        
-        # 이건 안들어가 모
-        interaction_dates = batch['interaction_dates'].to(device, non_blocking=True)
-        
-        if 'pretrained_vecs' in batch:
-            pretrained_vecs = batch['pretrained_vecs'].to(device, non_blocking=True)
-        else:
-            pretrained_vecs = dataloader.dataset.pretrained_lookup[item_ids.cpu()].to(device, non_blocking=True)
-            
-        forward_kwargs = {
-            'pretrained_vecs': pretrained_vecs,
-            'item_ids': item_ids,
-            'time_bucket_ids': time_bucket_ids,
-            'type_ids': type_ids, 'color_ids': color_ids,
-            'graphic_ids': graphic_ids, 'section_ids': section_ids,
-            'age_bucket': age_bucket, 'price_bucket': price_bucket,
-            'cnt_bucket': cnt_bucket, 'recency_bucket': recency_bucket,
-            'channel_ids': channel_ids, 'club_status_ids': club_status_ids,
-            'news_freq_ids': news_freq_ids, 'fn_ids': fn_ids,
-            'active_ids': active_ids, 'cont_feats': cont_feats,
-            'recency_offset': recency_offset, 'current_week': current_week, 'target_week': target_week,
-            'padding_mask': padding_mask,
-            'training_mode': True
-        }
-        # =======================================================
-        # 🕵️‍♂️ [Data Peek] 첫 번째 에포크, 첫 번째 배치에서 데이터 캡처!
-        # =======================================================
-        if epoch == 1 and batch_idx == 0:
-            print("\n" + "="*70)
-            print("🕵️‍♂️ [Tensor Peek] First Batch, First User Verification")
-            print("="*70)
-            
-            u_idx = 0 # 배치의 첫 번째 유저
-            seq_len = item_ids.shape[1]
-            valid_len = (~padding_mask[u_idx]).sum().item()
-            
-            print(f"✅ User Index in Batch: {u_idx} | Valid Length: {valid_len} / {seq_len}")
-            
-            # 1. 1명의 유저 시퀀스 데이터 확인 (패딩 포함 전체 리스트 출력)
-            print("\n[1. Sequence Alignment Check (Left Padding Expected)]")
-            print(f"📦 item_ids      : {item_ids[u_idx].tolist()}")
-            print(f"🎯 target_ids    : {target_ids[u_idx].tolist()}")
-            print(f"⏳ time_buckets  : {time_bucket_ids[u_idx].tolist()}")
-            print(f"📆 recency_offset: {recency_offset[u_idx].tolist()}")
-            print(f"💰 price_bucket  : {price_bucket[u_idx].tolist()}")
-            
-            # 2. forward_kwargs 형태(Shape) 확인
-            print("\n[2. forward_kwargs Shape Check]")
-            for k, v in forward_kwargs.items():
-                if isinstance(v, torch.Tensor):
-                    # 텐서인 경우 차원(Shape) 출력
-                    print(f" - {k:<15}: {list(v.shape)}")
-                else:
-                    # 텐서가 아닌 경우 (예: training_mode) 값 출력
-                    print(f" - {k:<15}: {v}")
-            print("="*70 + "\n")
-        # -------------------------------------------------------
-        # 2. Forward & Loss Calculation (AMP)
-        # -------------------------------------------------------
-        
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
-            '''
-            allowed_backends = [
-                SDPBackend.FLASH_ATTENTION, 
-                SDPBackend.EFFICIENT_ATTENTION
-            ]
-    
-            with sdpa_kernel(allowed_backends):
-            '''
-            output_1 = model(**forward_kwargs)
-            # output_2 = model(**forward_kwargs) # (DuoRec 제거되었으므로 주석 처리 권장)
-            
-            valid_mask = ~padding_mask 
-            batch_size, seq_len = item_ids.shape
-            # ===========================================================
-            # 💡 [Real Time-Decay Weighting] 물리적 시간(Day) 기반 지수 감쇠
-            # ===========================================================
-            
-            # 1. 유저별 시퀀스 내의 가장 최근 날짜(Max Date) 구하기
-            # ordinal 날짜는 양수이므로 패딩(0)이 포함되어도 max 취하면 최신 날짜가 나옴
-            max_dates = interaction_dates.masked_fill(padding_mask, -1).max(dim=1, keepdim=True)[0]            
-            # 2. 가장 최근 날짜로부터 각 상호작용 시점까지의 실제 시간 차이 (Days)
-            # Shape: [batch_size, seq_len]
-            delta_t = (max_dates - interaction_dates).float()
-            
-            # 3. 지수 감쇠 (Exponential Decay) 파라미터 설정
-            min_weight = 0.2    # 매우 오래된 클릭이 수렴할 최소 가중치 (20%)
-            half_life = 21.0    # 💡 직관적인 튜닝을 위한 반감기: n일 전 클릭은 중요도가 절반이 됨
-            
-            import math
-            decay_rate = math.log(2) / half_life # lambda 계산
-            
-            # 4. 수식: w = min_weight + (1 - min_weight) * exp(-lambda * delta_t)
-            # delta_t가 0이면(최근 행동, 당일), exp(0)=1 이므로 자동으로 1.0이 부여됨.
-            seq_weights = min_weight + (1.0 - min_weight) * torch.exp(-decay_rate * delta_t)
-            
-            # 5. 유효한 스텝만 평탄화
-            # 패딩 부분의 delta_t는 엄청 커서 min_weight로 수렴하겠지만, valid_mask로 걸러내므로 무시됨
-            flat_weights = seq_weights[valid_mask] 
-            
-            # ===========================================================
-
-            seq_positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-            last_indices = torch.max(seq_positions.masked_fill(~valid_mask, -1), dim=1)[0]
-            last_indices = last_indices.clamp(min=0) 
-            
-            batch_range = torch.arange(batch_size, device=device)
-            is_last_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
-            is_last_mask[batch_range, last_indices] = True
-            
-            flat_output = output_1[valid_mask] 
-            flat_targets = target_ids[valid_mask]
-            flat_is_last = is_last_mask[valid_mask] 
-            
-            batch_row_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, seq_len)
-            flat_user_ids = batch_row_indices[valid_mask] 
-            
-            if flat_output.size(0) > 0:
-                flat_user_emb = F.normalize(flat_output, p=2, dim=1)
-                flat_history_item_ids = item_ids[flat_user_ids] # Shape: [N, seq_len]
-                # 💡 [신규] 현재 배치의 정답 타겟들에 대한 하드 네거티브 K개를 추출
-                # flat_targets: [N], batch_hard_neg_ids: [N, K]
-                if hard_neg_pool_tensor is not None:
-                    batch_hard_neg_ids = hard_neg_pool_tensor[flat_targets]
-                else:
-                    batch_hard_neg_ids = None
-
-                all_item_emb = item_tower.get_all_embeddings()
-                norm_item_embeddings = F.normalize(all_item_emb, p=2, dim=1)
-
-                main_loss, b_metrics = inbatch_corrected_logq_loss_with_hybrid_hard_neg(
-                    user_emb=flat_user_emb, item_tower_emb=norm_item_embeddings,
-                    target_ids=flat_targets, user_ids=flat_user_ids,
-                    log_q_tensor=log_q_tensor, 
-                    batch_hard_neg_ids=batch_hard_neg_ids, 
-                    flat_history_item_ids=flat_history_item_ids,
-                    step_weights=flat_weights,# 💡 Loss 함수로 전달!
-                    temperature=0.07, lambda_logq=cfg.lambda_logq,   # 💡 [신규] 0.05 마진 부여 (보수적 시작)
-                    alpha=1.0,
-                    soft_penalty_weight=cfg.soft_penalty_weigh,
-                    margin=0.0,
-                    
-                    return_metrics=True
-                )
-                # 💡 [버그 수정 완료] 들여쓰기를 정상 위치(if 블록 내부)로 복구했습니다!
-                if 'hn/danger_zone_ratio' in b_metrics:
-                    epoch_danger_ratio_sum += b_metrics['hn/danger_zone_ratio']
-                    num_batches += 1
-                    
-            else:
-                main_loss = torch.tensor(0.0, device=device)
-            
-            
-        
-                
-            total_loss = main_loss 
-            
-
-            # 💡 [핵심 3] 그래디언트 누적을 위한 Loss 스케일링
-            # 두 번 누적할 것이므로, 1번 더해질 때마다 절반의 크기로 더해져야 
-            # 배치 768을 한 번에 처리한 것과 수학적으로 동일한 스케일이 됩니다.
-            scaled_loss = total_loss / accumulation_steps
-
-        # -------------------------------------------------------
-        # 3. Backward (Loss 누적)
-        # -------------------------------------------------------
-        # 주의: scaled_loss로 backward를 수행해야 그래디언트 크기가 유지됩니다.
-        scaler.scale(scaled_loss).backward()
-
-        # -------------------------------------------------------
-        # 4. Optimizer Step & Scheduler (누적 주기에 도달했을 때만)
-        # -------------------------------------------------------
-        # 마지막 남은 자투리 배치(len(dataloader)와 같을 때)도 잊지 않고 업데이트해야 함
-        if ((batch_idx + 1) % accumulation_steps == 0) or ((batch_idx + 1) == len(dataloader)):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            scaler.step(optimizer)
-            scaler.update()
-            
-            # 여기서 그래디언트를 비워줍니다.
-            #optimizer.zero_grad()
-            optimizer.zero_grad(set_to_none=True)
-            # 스케줄러도 "유효 배치(Effective Batch)"가 끝났을 때만 스텝을 밟습니다.
-            if scheduler is not None:
-                scheduler.step()
-
-        # -------------------------------------------------------
-        # 5. Logging (주의: 모니터링은 무조건 Unscaled Loss로!)
-        # -------------------------------------------------------
-        # 누적용 변수나 화면에 보여줄 때는 쪼개지 않은 원래 total_loss를 써야 착시가 없습니다.
-        total_loss_accum += total_loss.item()
-        main_loss_accum += main_loss.item()
-        
-        
-        
-        pbar.set_postfix({
-            'Loss': f"{total_loss.item():.4f}",
-            'Main': f"{main_loss.item():.4f}"
-        })
-        
-        # 100번 단위 로깅도 미니배치(384) 기준 100번이 됩니다.
-        if batch_idx % 100 == 0:
-            wandb_log_dict = {"Train/Main_Loss": main_loss.item()}
-            for k in ['sim/pos', 'hn/survived_ratio', 'sim/hn_all', 'sim/hn', 'hn/influence_ratio', 
-                      'sim/soft_pos', 'prob/true_pos', 'hn/penalized_ratio', 'sim/hn_penalized', 
-                      'hn/relative_influence', 'hn/danger_zone_ratio']:
-                if k in b_metrics:
-                    log_key = k if '/' in k else f"Train/{k}"
-                    if k == 'sim/hn': log_key = "Train/sim:hn_candidate_mean"
-                    if k == 'sim/hn_all': log_key = "Train/sim:hn_all_mean"
-                    wandb_log_dict[log_key] = b_metrics[k]
-
-            if 'sim/peer_top1_mean' in b_metrics:
-                wandb_log_dict.update({
-                    "Peer_Sim/Top1_Mean": b_metrics['sim/peer_top1_mean'],
-                    "Peer_Sim/Top1_Max": b_metrics['sim/peer_top1_max'],
-                    "Peer_Sim/Top1_Min": b_metrics['sim/peer_top1_min']
-                })
-            if 'sim/peer_top1_raw' in b_metrics:
-                wandb_log_dict["Peer_Sim/Top1_Distribution"] = wandb.Histogram(b_metrics['sim/peer_top1_raw'].numpy())
-
-            wandb.log(wandb_log_dict)
-        # mini-batch deloc
-        del output_1, flat_output, flat_targets, flat_is_last, flat_user_ids
-        del main_loss, total_loss, scaled_loss
-        
-        # 2. 부피가 큰 입력 피처 텐서 일괄 해제
-        del item_ids, target_ids, padding_mask, time_bucket_ids, pretrained_vecs
-        del type_ids, color_ids, graphic_ids, section_ids
-        del age_bucket, price_bucket, cnt_bucket, recency_bucket
-        del channel_ids, club_status_ids, news_freq_ids, fn_ids, active_ids, cont_feats
-        del recency_offset, current_week,interaction_dates
-        if 'flat_user_emb' in locals():
-            del flat_user_emb, all_item_emb, norm_item_embeddings
-        
-    # 에포크 종료 후 평균 Loss 계산
-    avg_loss = total_loss_accum / len(dataloader)
-    avg_main = main_loss_accum / len(dataloader)
-    avg_cl = cl_loss_accum / len(dataloader) if cl_loss_accum > 0 else 0.0
-
-
-
-    avg_danger_ratio = epoch_danger_ratio_sum / num_batches if num_batches > 0 else 0.0
-    print(f"📊 Epoch [{epoch}] Avg Danger Zone Ratio: {avg_danger_ratio:.4f}")
-
-    # 4. 💡 [핵심] 스케줄러에 통보하여 EX-TOP-K 동적 조절
-    if hn_scheduler is not None:
-        updated, new_ex_top_k, moving_avg = hn_scheduler.step(avg_danger_ratio)
-        
-        if updated:
-            print(f" [Scheduler Alert] 3-Epoch Moving Avg Danger Ratio ({moving_avg:.4f}) exceeded 0.04!")
-            print(f"📈 EX-TOP-K Expanded: {cfg.EX_TOP_K} -> {new_ex_top_k}")
-            cfg.EX_TOP_K = new_ex_top_k
-            force_mining_next_epoch = True # 바깥 루프에 채굴 명령 하달
-
-
-    # Gate Weights Logging
-    with torch.no_grad():
-        s_weights = torch.sigmoid(model.seq_gate).cpu().numpy()
-        u_weights = torch.sigmoid(model.static_gate).cpu().numpy()
-        
-        gate_log = {}
-        if seq_labels and len(seq_labels) == len(s_weights):
-            gate_log.update({f"Gate/Seq_{label}": w for label, w in zip(seq_labels, s_weights)})
-        if static_labels and len(static_labels) == len(u_weights):
-            gate_log.update({f"Gate/Static_{label}": w for label, w in zip(static_labels, u_weights)})
-            
-        if gate_log:
-            wandb.log(gate_log)
-
-    print(f"🏁 Epoch {epoch} Completed | Avg Total: {avg_loss:.4f} (Main: {avg_main:.4f}, CL: {avg_cl:.4f})")
-    return avg_loss, force_mining_next_epoch
-from prefetch_generator import BackgroundGenerator
-class CUDAPrefetcher:
+def log_feature_contributions_v4(model, wandb, epoch=None):
     """
-    현재 배치를 연산하는 동안, 다음 배치를 백그라운드 스트림으로 GPU에 미리 올림
-    num_workers=0이어도 GPU 전송 대기시간을 숨길 수 있음
+    SASRecUserTower_v4 전용 WandB 피처 기여도 로깅
+    
+    v3 (sigmoid gate 값) → v4 (weight norm 기반 실질 기여도)
+    
+    모니터링 항목:
+      1. Item Stream: 컴포넌트별 LayerNorm weight norm
+         → pretrained / item_id / price 각각의 실질 스케일
+      2. Static Stream: Embedding weight norm (피처별 행 평균)
+         → static_mlp 첫 번째 레이어 열 norm (피처 블록별)
+      3. cont_mlp: 입력 가중치 norm (asof 4개 피처별)
+      4. SENet gate: fusion_gate 평균 활성화 (seq vs static 비율)
+      5. target_week_gate: 스칼라 값 (유일하게 남은 gate)
     """
-    def __init__(self, dataloader, device):
-        self.dataloader = dataloader
-        self.device = device
-        self.stream = torch.cuda.Stream()  # 전용 전송 스트림
-        self.next_batch = None
-        self._iter = None
-
-    def _preload(self):
-        try:
-            raw = next(self._iter)
-        except StopIteration:
-            self.next_batch = None
-            return
-
-        # 💡 핵심: 메인 스트림과 분리된 스트림에서 GPU 전송
-        with torch.cuda.stream(self.stream):
-            self.next_batch = {
-                k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-                for k, v in raw.items()
-            }
-
-    def __iter__(self):
-        self._iter = iter(self.dataloader)
-        self._preload()  # 첫 배치 미리 올리기
-        return self
-
-    def __next__(self):
-        # 메인 스트림이 전송 스트림 완료를 기다림
-        torch.cuda.current_stream().wait_stream(self.stream)
-        batch = self.next_batch
-
-        if batch is None:
-            raise StopIteration
-
-        # 텐서가 스트림 동기화됐음을 명시적으로 표시
-        for v in batch.values():
-            if isinstance(v, torch.Tensor):
-                v.record_stream(torch.cuda.current_stream())
-
-        self._preload()  # 다음 배치 미리 올리기 시작 (비동기)
-        return batch
-
-    def __len__(self):
-        return len(self.dataloader)
-    
-class PrefetchLoader:
-    """
-    백그라운드 스레드 1개가 미리 다음 배치를 준비
-    num_workers=0이어도 CPU 전처리 대기시간을 GPU 연산과 겹침
-    """
-    def __init__(self, loader):
-        self.loader = loader
-
-    def __iter__(self):
-        return BackgroundGenerator(iter(self.loader))
-
-    def __len__(self):
-        return len(self.loader)
-    
-    # DataLoader 속성 접근 필요시 (dataset 등)
-    def __getattr__(self, name):
-        return getattr(self.loader, name)
-    
-def train_user_tower_cl_enhance(epoch, model, item_tower,norm_item_embeddings, log_q_tensor, dataloader, optimizer, scaler, cfg, device, hard_neg_pool_tensor, scheduler, hn_scheduler ,seq_labels=None, static_labels=None):
-    """단일 에포크 훈련 함수 (All Time Steps + Same-User Masking 적용) + Gradient Accumulation"""
-    model.train()
-    total_loss_accum = 0.0
-    main_loss_accum = 0.0
-    cl_loss_accum = 0.0
-    epoch_danger_ratio_sum = 0.0
-    num_batches = 0
-    
-    # 💡 [추가] 스케줄러 계산을 위한 누적 변수 초기화
-    epoch_sim_pos_sum = 0.0
-    epoch_sim_hn_sum = 0.0
-    epoch_penalized_ratio_sum = 0.0
-    num_hn_batches = 0
-
-    # 💡 [핵심 1] 누적 스텝 설정 (384 * 2 = 768)
-    accumulation_steps = 1
-    force_mining_next_epoch = False
-    
-    seq_labels = seq_labels or []
-    static_labels = static_labels or []
-    
-    
-    
-    
-
-    #prefetch_loader = CUDAPrefetcher(dataloader, device)  
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
-    
-    
-    
-
-    
-    
-    # 💡 [핵심 2] 루프 시작 전, 혹시 남아있을지 모르는 이전 에포크의 그래디언트 초기화
-    #optimizer.zero_grad()
-    
-    optimizer.zero_grad(set_to_none=True)
-    
-    for batch_idx, batch in enumerate(pbar):
+    log_dict = {}
  
-        
-        item_ids = batch['item_ids'].to(device, non_blocking=True)
-        target_ids = batch['target_ids'].to(device, non_blocking=True)
-        padding_mask = batch['padding_mask'].to(device, non_blocking=True)
-        time_bucket_ids = batch['time_bucket_ids'].to(device, non_blocking=True)
-        session_ids = batch['session_ids'].to(device, non_blocking=True)
-        type_ids = batch['type_ids'].to(device, non_blocking=True)
-        color_ids = batch['color_ids'].to(device, non_blocking=True)
-        graphic_ids = batch['graphic_ids'].to(device, non_blocking=True)
-        section_ids = batch['section_ids'].to(device, non_blocking=True)
-        
-        age_bucket = batch['age_bucket'].to(device, non_blocking=True)
-        price_bucket = batch['price_bucket'].to(device, non_blocking=True)
-        cnt_bucket = batch['cnt_bucket'].to(device, non_blocking=True)
-        recency_bucket = batch['recency_bucket'].to(device, non_blocking=True)
-        
-        channel_ids = batch['channel_ids'].to(device, non_blocking=True)
-        club_status_ids = batch['club_status_ids'].to(device, non_blocking=True)
-        news_freq_ids = batch['news_freq_ids'].to(device, non_blocking=True)
-        fn_ids = batch['fn_ids'].to(device, non_blocking=True)
-        active_ids = batch['active_ids'].to(device, non_blocking=True)
-        cont_feats = batch['cont_feats'].to(device, non_blocking=True)
-        
-        recency_offset = batch['recency_offset'].to(device, non_blocking=True)
-        current_week = batch['current_week'].to(device, non_blocking=True)
-        target_week = batch['target_week'].to(device, non_blocking=True)
-        
-        # 이건 안들어가 모
-        interaction_dates = batch['interaction_dates'].to(device, non_blocking=True)
-        
-        if 'pretrained_vecs' in batch:
-            pretrained_vecs = batch['pretrained_vecs'].to(device, non_blocking=True)
-        else:
-            pretrained_vecs = dataloader.dataset.pretrained_lookup[item_ids.cpu()].to(device, non_blocking=True)
-        
-        forward_kwargs_v1 = {
-            'pretrained_vecs': pretrained_vecs,
-            'item_ids': item_ids,
-            'time_bucket_ids': time_bucket_ids,
-            'type_ids': type_ids, 'color_ids': color_ids,
-            'graphic_ids': graphic_ids, 'section_ids': section_ids,
-            'age_bucket': age_bucket, 'price_bucket': price_bucket,
-            'cnt_bucket': cnt_bucket, 'recency_bucket': recency_bucket,
-            'channel_ids': channel_ids, 'club_status_ids': club_status_ids,
-            'news_freq_ids': news_freq_ids, 'fn_ids': fn_ids,
-            'active_ids': active_ids, 'cont_feats': cont_feats,
-            'recency_offset': recency_offset, 'current_week': current_week, 'target_week': target_week,
-            'padding_mask': padding_mask,
-            'training_mode': True
-        }
-
-        # =======================================================
-        # 🕵️‍♂️ [Data Peek] 첫 번째 에포크, 첫 번째 배치에서 데이터 캡처!
-        # =======================================================
-        if epoch == 1 and batch_idx == 0:
-            print("\n" + "="*70)
-            print("🕵️‍♂️ [Tensor Peek] First Batch, First User Verification")
-            print("="*70)
-            
-            u_idx = 0 # 배치의 첫 번째 유저
-            seq_len = item_ids.shape[1]
-            valid_len = (~padding_mask[u_idx]).sum().item()
-            
-            print(f"✅ User Index in Batch: {u_idx} | Valid Length: {valid_len} / {seq_len}")
-            
-            # 1. 1명의 유저 시퀀스 데이터 확인 (패딩 포함 전체 리스트 출력)
-            print("\n[1. Sequence Alignment Check (Left Padding Expected)]")
-            print(f"📦 item_ids      : {item_ids[u_idx].tolist()}")
-            print(f"🎯 target_ids    : {target_ids[u_idx].tolist()}")
-            print(f"⏳ time_buckets  : {time_bucket_ids[u_idx].tolist()}")
-            print(f"📆 recency_offset: {recency_offset[u_idx].tolist()}")
-            print(f"💰 price_bucket  : {price_bucket[u_idx].tolist()}")
-            
-            # 2. forward_kwargs 형태(Shape) 확인
-            print("\n[2. forward_kwargs Shape Check]")
-            for k, v in forward_kwargs_v1.items():
-                if isinstance(v, torch.Tensor):
-                    # 텐서인 경우 차원(Shape) 출력
-                    print(f" - {k:<15}: {list(v.shape)}")
-                else:
-                    # 텐서가 아닌 경우 (예: training_mode) 값 출력
-                    print(f" - {k:<15}: {v}")
-            print("="*70 + "\n")
-
-        # -------------------------------------------------------
-        # 2. Forward & Loss Calculation (AMP)
-        # -------------------------------------------------------
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
-            # 두 뷰에 대해 각각 모델 통과
-            output_1 = model(**forward_kwargs_v1)
-            #output_2 = model(**forward_kwargs_v1)
-            
-            # 💡 메인 타스크용 마스크 및 정보는 모두 'View 1' 기준
-            valid_mask = ~padding_mask
-            batch_size, seq_len = item_ids.shape
-            
-            # [Real Time-Decay Weighting]
-            max_dates = interaction_dates.masked_fill(padding_mask, -1).max(dim=1, keepdim=True)[0]            
-            delta_t = (max_dates - interaction_dates).float()
-            min_weight, half_life = 0.2, 21.0
-            import math
-            decay_rate = math.log(2) / half_life
-            seq_weights = min_weight + (1.0 - min_weight) * torch.exp(-decay_rate * delta_t)
-            flat_weights = seq_weights[valid_mask] 
-            
-            # [Last Indices Masking] - v1과 v2 각각의 마지막 스텝 위치 계산
-            seq_positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-            batch_range = torch.arange(batch_size, device=device)
-            
-            last_indices = torch.max(seq_positions.masked_fill(~valid_mask, -1), dim=1)[0].clamp(min=0)
-            is_last_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
-            is_last_mask[batch_range, last_indices] = True
-
-
-            # =======================================================
-            # [1] Main Loss 계산 (View 1 타겟 및 임베딩만 사용)
-            # =======================================================
-            flat_output = output_1[valid_mask] 
-            flat_targets = target_ids[valid_mask]
-            
-            batch_row_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, seq_len)
-            flat_user_ids = batch_row_indices[valid_mask] 
-            flat_is_last = is_last_mask[valid_mask]
-            MAX_FLAT_SIZE = 9000
-            
-            if flat_output.size(0) > MAX_FLAT_SIZE:
-                print(f"⚠️ [Memory Protection] Batch elements ({flat_output.size(0)}) > {MAX_FLAT_SIZE}. Truncating oldest steps...")
-                
-                # 💡 핵심 로직: flat_weights가 클수록 최신 데이터임.
-                # torch.topk를 사용해 가중치가 가장 높은 상위 MAX_FLAT_SIZE개의 인덱스만 추출 (정렬 연산 최소화로 매우 빠름)
-                _, recent_idx = torch.topk(flat_weights, k=MAX_FLAT_SIZE)
-                
-                # 추출된 최신 인덱스로 텐서 덮어씌우기
-                flat_output = flat_output[recent_idx]
-                flat_targets = flat_targets[recent_idx]
-                flat_user_ids = flat_user_ids[recent_idx]
-                flat_weights = flat_weights[recent_idx]
-                flat_is_last = flat_is_last[recent_idx]
-            
-            if flat_output.size(0) > 0:
-                flat_user_emb = F.normalize(flat_output, p=2, dim=1)
-                flat_history_item_ids = item_ids[flat_user_ids] 
-                
-                # 💡 grad 전파
-                batch_seq_item_emb = item_tower.item_matrix.weight[flat_targets]
-                batch_seq_item_emb = F.normalize(batch_seq_item_emb, p=2, dim=1)
-
-                # =======================================================
-                # 💡 [핵심 2] 하드 네거티브 VRAM 최적화 (Early Slicing)
-                # =======================================================
-                batch_hn_item_emb = None
-                batch_hard_neg_ids = None
-                final_idx = None # Loss 함수에서 조립할 위치 인덱스
-                
-                if hard_neg_pool_tensor is not None:
-                    # flat된 데이터 중 진짜 마지막 스텝(True)의 인덱스만 추출 [num_finals]
-                    
-                    HNM_WEIGHT_THRESHOLD = 0.6
-                    hnm_eligible = flat_weights >= HNM_WEIGHT_THRESHOLD
-                    # 단, 마지막 스텝은 threshold 무관하게 항상 포함
-                    hnm_eligible = hnm_eligible | flat_is_last
-                    
-                    
-                    final_idx = hnm_eligible.nonzero(as_tuple=True)[0]
-                    
-                    if final_idx.numel() > 0:
-                        # 오직 마지막 스텝에 해당하는 타겟 ID만 가져옵니다.
-                        final_targets = flat_targets[final_idx]
-                        
-                        # [num_finals, 150] 및 [num_finals, 150, D] 크기로 최소한의 메모리만 사용!
-                        batch_hard_neg_ids = hard_neg_pool_tensor[final_targets] 
-                        batch_hn_item_emb = norm_item_embeddings[batch_hard_neg_ids]
-                
-                main_loss, b_metrics = inbatch_corrected_logq_loss_with_hybrid_hard_neg(
-                    user_emb=flat_user_emb, seq_item_emb=batch_seq_item_emb,
-                    target_ids=flat_targets, user_ids=flat_user_ids,
-                    log_q_tensor=log_q_tensor, 
-                    hn_item_emb=batch_hn_item_emb, batch_hard_neg_ids=batch_hard_neg_ids, 
-                    flat_history_item_ids=flat_history_item_ids, step_weights=flat_weights,
-                    final_idx=final_idx,  
-                    temperature=0.1, lambda_logq=cfg.lambda_logq, alpha=1.0,
-                    soft_penalty_weight=cfg.soft_penalty_weigh, margin=0.0, return_metrics=True
-                )
-
-            else:
-                main_loss = torch.tensor(0.0, device=device)
-            
-            # =======================================================
-            # [2] Semantic Contrastive Loss 계산
-            # =======================================================
-            
-       
-            
-            total_loss = main_loss 
-            scaled_loss = total_loss / accumulation_steps    
-            
-
-        # -------------------------------------------------------
-        # 3 & 4. Backward & Optimizer Step (기존과 완전 동일)
-        # -------------------------------------------------------
-        scaler.scale(scaled_loss).backward()
-        if ((batch_idx + 1) % accumulation_steps == 0) or ((batch_idx + 1) == len(dataloader)):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            if scheduler is not None:
-                scheduler.step()
-
-        # -------------------------------------------------------
-        # 5. Logging & Memory Cleanup
-        # -------------------------------------------------------
-        total_loss_accum += total_loss.item()
-        main_loss_accum += main_loss.item()
-        #cl_loss_accum += cl_loss.item() # 💡 에포크 종료 후 평균 CL 계산을 위해 추가
-        
-        pbar.set_postfix({
-            'Main_Loss': f"{main_loss.item():.4f}", # 💡 Postfix에는 순수 main_loss 표기 권장
-         #   'CL_Loss': f"{cl_loss.item():.4f}"
-        })
-        # 100번 단위 로깅도 미니배치(384) 기준 100번이 됩니다.
-        if batch_idx % 100 == 0:
-            wandb_log_dict = {
-                "Train/Main_Loss": main_loss.item(),
-             #   "Train/CL_Loss": cl_loss.item()
-                }
-            for k in ['sim/pos',  'sim/hn_all', 'sim/hn', 'hn/influence_ratio', 
-                    'hn/penalized_ratio', 'sim/hn_penalized', 'sim/hn_true_hard','hn/discarded_ratio',
-                      'hn/relative_influence', 'hn/danger_zone_ratio']:
-                if k in b_metrics:
-                    log_key = k if '/' in k else f"Train/{k}"
-                    if k == 'sim/hn': log_key = "Train/sim:hn_candidate_mean"
-                    if k == 'sim/hn_all': log_key = "Train/sim:hn_all_mean"
-                    wandb_log_dict[log_key] = b_metrics[k]
-
-            if 'sim/peer_top1_mean' in b_metrics:
-                wandb_log_dict.update({
-                    "Peer_Sim/Top1_Mean": b_metrics['sim/peer_top1_mean'],
-                    "Peer_Sim/Top1_Max": b_metrics['sim/peer_top1_max'],
-                    "Peer_Sim/Top1_Min": b_metrics['sim/peer_top1_min']
-                })
-            if 'sim/peer_top1_raw' in b_metrics:
-                wandb_log_dict["Peer_Sim/Top1_Distribution"] = wandb.Histogram(b_metrics['sim/peer_top1_raw'].numpy())
-
-            # 💡 [신규] DuoRec 지표 로깅 추가
-            if 'cl/has_peer_ratio' in b_metrics:
-                wandb_log_dict["CL_Stats/Has_Peer_Ratio"] = b_metrics['cl/has_peer_ratio']
-                wandb_log_dict["CL_Stats/Avg_Peers_Per_Seq"] = b_metrics['cl/avg_peers']
-            
-
-            for k in ['cl/semantic_gap', 'cl/peer_user_sim', 'cl/avg_peers', 'cl/target_margin','cl/negative_user_sim']:
-                if k in b_metrics:
-                    log_key = k
-                    wandb_log_dict[log_key] = b_metrics[k]
-            wandb.log(wandb_log_dict)       
-        
-        # mini-batch deloc
-        del output_1, flat_output, flat_targets, flat_user_ids
-        del main_loss, scaled_loss, total_loss
-        
-        # View 1 텐서 삭제
-        del item_ids, target_ids, padding_mask, time_bucket_ids, pretrained_vecs
-        del type_ids, color_ids, graphic_ids, section_ids, session_ids
-        del price_bucket, cnt_bucket, recency_bucket, channel_ids, cont_feats
-        del recency_offset, current_week, target_week, interaction_dates
-        ''' 
-        # View 2 텐서 삭제
-        del item_ids_v2, target_ids_v2, padding_mask_v2, time_bucket_ids_v2, pretrained_vecs_v2
-        del type_ids_v2, color_ids_v2, graphic_ids_v2, section_ids_v2, session_ids_v2
-        del price_bucket_v2, cnt_bucket_v2, recency_bucket_v2, channel_ids_v2, cont_feats_v2
-        del recency_offset_v2, current_week_v2, target_week_v2, interaction_dates_v2
-        '''
-        # 공통 정적 텐서 삭제
-        del age_bucket, club_status_ids, news_freq_ids, fn_ids, active_ids
-        
-        if 'flat_user_emb' in locals():
-            del flat_user_emb
-        
-    # 에포크 종료 후 평균 Loss 계산
-    avg_loss = total_loss_accum / len(dataloader)
-    avg_main = main_loss_accum / len(dataloader)
-    avg_cl = cl_loss_accum / len(dataloader) if cl_loss_accum > 0 else 0.0
-
-
-
-    avg_danger_ratio = epoch_danger_ratio_sum / num_batches if num_batches > 0 else 0.0
-    print(f"📊 Epoch [{epoch}] Avg Danger Zone Ratio: {avg_danger_ratio:.4f}")
-
-    # 1. HNM이 실제로 발동된 배치들의 평균 지표 계산
-    if num_hn_batches > 0:
-        avg_sim_pos = epoch_sim_pos_sum / num_hn_batches
-        avg_sim_hn = epoch_sim_hn_sum / num_hn_batches
-        avg_penalized_ratio = epoch_penalized_ratio_sum / num_hn_batches
-    else:
-        avg_sim_pos, avg_sim_hn, avg_penalized_ratio = 0.0, 0.0, 0.0
-
-    print(f"📊 Epoch [{epoch}] Avg Margin: {(avg_sim_pos - avg_sim_hn):.4f} | Penalized Ratio: {avg_penalized_ratio:.4f}")
-
-    # 2. 💡 [핵심] TrendBasedHNScheduler 호출 부분
-    if hn_scheduler is not None and num_hn_batches > 0:
-        
-        # step 함수에 1 에포크 동안의 평균값 3개를 정확히 매핑하여 전달합니다.
-        updated, new_ex_top_k, reason = hn_scheduler.step(
-            sim_pos=avg_sim_pos, 
-            sim_hn=avg_sim_hn, 
-            penalized_ratio=avg_penalized_ratio
-        )
-        
-        # 스케줄러가 위험을 감지하고 확장을 결정했다면 적용
-        if updated:
-            print(f"🚨 [Scheduler Alert] {reason}")
-            print(f"📈 EX-TOP-K Expanded: {cfg.EX_TOP_K} -> {new_ex_top_k}")
-            
-            cfg.EX_TOP_K = new_ex_top_k
-            force_mining_next_epoch = True # 다음 에포크 시작 시 확장된 K를 반영하여 재채굴 지시
-    
-    # Gate Weights Logging
     with torch.no_grad():
-        s_weights = torch.sigmoid(model.seq_gate).cpu().numpy()
-        u_weights = torch.sigmoid(model.static_gate).cpu().numpy()
-        
-        gate_log = {}
-        if seq_labels and len(seq_labels) == len(s_weights):
-            gate_log.update({f"Gate/Seq_{label}": w for label, w in zip(seq_labels, s_weights)})
-        if static_labels and len(static_labels) == len(u_weights):
-            gate_log.update({f"Gate/Static_{label}": w for label, w in zip(static_labels, u_weights)})
-            
-        if gate_log:
-            wandb.log(gate_log)
-
-    print(f"🏁 Epoch {epoch} Completed | Avg Total: {avg_loss:.4f} (Main: {avg_main:.4f}, CL: {avg_cl:.4f})")
-    return avg_loss, force_mining_next_epoch
+ 
+        # ════════════════════════════════════════════════════════
+        # 1. Item Stream 컴포넌트별 LayerNorm weight norm
+        #    LayerNorm.weight = 각 차원의 스케일 파라미터
+        #    norm이 클수록 해당 컴포넌트가 item_emb에서 큰 스케일 유지
+        # ════════════════════════════════════════════════════════
+        ln_norms = {
+            'ItemStream/ln_pretrained': model.ln_pretrained.weight,
+            'ItemStream/ln_item_id':    model.ln_item_id.weight,
+            'ItemStream/ln_price':      model.ln_price.weight,
+        }
+        for name, weight in ln_norms.items():
+            log_dict[f"{name}_norm"] = weight.norm().item()
+            log_dict[f"{name}_mean"] = weight.mean().item()
+ 
+        # ════════════════════════════════════════════════════════
+        # 2. Static Stream Embedding weight norm (피처별)
+        #    각 Embedding의 weight matrix row norm 평균
+        #    → 유효 인덱스(padding 제외)의 평균 활성화 크기
+        # ════════════════════════════════════════════════════════
+        emb_modules = {
+            'Static/emb_age':   model.age_emb,
+            'Static/emb_chan':   model.channel_emb,
+            'Static/emb_club':  model.club_status_emb,
+            'Static/emb_news':  model.news_freq_emb,
+            'Static/emb_fn':    model.fn_emb,
+            'Static/emb_act':   model.active_emb,
+        }
+        for name, emb in emb_modules.items():
+            # padding_idx=0 제외하고 norm 계산
+            valid_weights = emb.weight[1:]                  # (vocab-1, dim)
+            row_norms = valid_weights.norm(dim=1)           # (vocab-1,)
+            log_dict[f"{name}_norm_mean"] = row_norms.mean().item()
+            log_dict[f"{name}_norm_max"]  = row_norms.max().item()
+ 
+        # ════════════════════════════════════════════════════════
+        # 3. cont_mlp 입력 가중치 norm (asof 피처별 기여도)
+        #    cont_mlp.mlp[0] = Linear(4, d_model)
+        #    weight shape: (d_model, 4)
+        #    각 열(column)의 norm = 해당 asof 피처가 출력에 미치는 영향
+        # ════════════════════════════════════════════════════════
+        cont_linear = model.cont_mlp.mlp[0]                # Linear(4, d_model)
+        col_norms = cont_linear.weight.norm(dim=0)         # (4,) 피처별 열 norm
+ 
+        asof_labels = [
+            'price_std',
+            'last_price_diff',
+            'repurchase_ratio',
+            'weekend_ratio'
+        ]
+        for label, norm_val in zip(asof_labels, col_norms):
+            log_dict[f"ContMLP/asof_{label}_col_norm"] = norm_val.item()
+ 
+        # ════════════════════════════════════════════════════════
+        # 4. static_mlp 첫 번째 레이어 열 norm (피처 블록별)
+        #    static_mlp[0] = Linear(36+D, D)
+        #    weight shape: (D, 36+D)
+        #    피처 블록별 열 norm 합산 → 각 피처 그룹의 실질 기여도
+        # ════════════════════════════════════════════════════════
+        d_model = model.d_model
+        static_linear = model.static_mlp[0]               # Linear(36+D, D)
+        col_norms_static = static_linear.weight.norm(dim=0)  # (36+D,)
+ 
+        # 피처 블록 인덱스 정의
+        # age(16) | chan(4) | club(4) | news(4) | fn(4) | act(4) | cont_mlp(D)
+        static_blocks = {
+            'StaticMLP/age':       (0,  16),
+            'StaticMLP/channel':   (16, 20),
+            'StaticMLP/club':      (20, 24),
+            'StaticMLP/news':      (24, 28),
+            'StaticMLP/fn':        (28, 32),
+            'StaticMLP/active':    (32, 36),
+            'StaticMLP/cont_mlp':  (36, 36 + d_model),
+        }
+        for name, (start, end) in static_blocks.items():
+            block_norm = col_norms_static[start:end].mean().item()
+            log_dict[f"{name}_col_norm"] = block_norm
+ 
+        # ════════════════════════════════════════════════════════
+        # 5. target_week_gate (유일하게 남은 sigmoid gate)
+        # ════════════════════════════════════════════════════════
+        gate_val = torch.sigmoid(model.target_week_gate).item()
+        log_dict['Gate/target_week'] = gate_val
+ 
+        # ════════════════════════════════════════════════════════
+        # 6. SENet fusion_gate se 레이어 가중치 norm
+        #    se[-2] = Linear(D//4, D*2): excite 레이어
+        #    seq 절반 vs static 절반 norm 비교
+        #    → SENet이 두 스트림을 얼마나 구분하는지
+        # ════════════════════════════════════════════════════════
+        excite_weight = model.fusion_gate.se[-2].weight   # (D*2, D//4)
+        seq_half    = excite_weight[:d_model, :]           # (D, D//4)
+        static_half = excite_weight[d_model:, :]           # (D, D//4)
+ 
+        seq_norm    = seq_half.norm().item()
+        static_norm = static_half.norm().item()
+        total_norm  = seq_norm + static_norm + 1e-9
+ 
+        log_dict['SENet/seq_excite_norm']    = seq_norm
+        log_dict['SENet/static_excite_norm'] = static_norm
+        log_dict['SENet/seq_ratio']          = seq_norm / total_norm
+        log_dict['SENet/static_ratio']       = static_norm / total_norm
+ 
+    wandb.log(log_dict)
+ 
 
 def train_user_tower_session_sampler_with_intent_point(epoch, model, item_tower,norm_item_embeddings, log_q_tensor, 
                                                        dataloader, optimizer, scaler, cfg, device, 
@@ -3251,8 +2380,10 @@ def train_user_tower_session_sampler_with_intent_point(epoch, model, item_tower,
             'channel_ids': channel_ids, 'club_status_ids': club_status_ids,
             'news_freq_ids': news_freq_ids, 'fn_ids': fn_ids,
             'active_ids': active_ids, 'cont_feats': cont_feats,
-            'recency_offset': recency_offset, 'current_week': current_week, 'target_week': target_week,
+            'recency_offset': recency_offset, 'current_week': current_week, 
+            'target_week': target_week, 'session_ids': session_ids,
             'padding_mask': padding_mask,
+            
             'training_mode': True
         }
 
@@ -3541,7 +2672,7 @@ def train_user_tower_session_sampler_with_intent_point(epoch, model, item_tower,
             
             cfg.EX_TOP_K = new_ex_top_k
             force_mining_next_epoch = True # 다음 에포크 시작 시 확장된 K를 반영하여 재채굴 지시
-    
+    '''
     # Gate Weights Logging
     with torch.no_grad():
         s_weights = torch.sigmoid(model.seq_gate).cpu().numpy()
@@ -3555,6 +2686,8 @@ def train_user_tower_session_sampler_with_intent_point(epoch, model, item_tower,
             
         if gate_log:
             wandb.log(gate_log)
+    '''
+    log_feature_contributions_v4(model, wandb)
 
     print(f"🏁 Epoch {epoch} Completed | Avg Total: {avg_loss:.4f} (Main: {avg_main:.4f}, CL: {avg_cl:.4f})")
     return avg_loss, force_mining_next_epoch,  avg_discard_ratio
@@ -3584,8 +2717,8 @@ def resume_pipeline_session_weights():
     # -----------------------------------------------------------
     # 💡 하드 네거티브 및 하이퍼파라미터 세팅
     # -----------------------------------------------------------
-    cfg.lr = 1.5e-3               # 기존 학습률 유지
-    cfg.epochs = 30         # 이미 11에포크를 돌았으므로, 추가로 30에포크면 충분
+    cfg.lr = 3e-4               # 기존 학습률 유지
+    cfg.epochs = 20        # 이미 11에포크를 돌았으므로, 추가로 30에포크면 충분
     cfg.HN_K = 150  # 20개 추출 후 내부 0.95 제약으로 필터링
     cfg.EX_TOP_K = 0
     cfg.soft_penalty_weigh = 1
@@ -3652,7 +2785,7 @@ def resume_pipeline_session_weights():
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
     
     total_steps = len(train_loader) * cfg.epochs
-    warmup_steps = int(total_steps * 0.025) 
+    warmup_steps = int(total_steps * 0.001) 
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01) 
 
     
@@ -3694,13 +2827,13 @@ def resume_pipeline_session_weights():
             norm_item_embeddings = F.normalize(all_item_embs, p=2, dim=1) # [50000, Dim]
             
             # 10에포크부터는 이 캐시된 임베딩을 마이닝에도 재사용하여 속도 극대화
-            if epoch >= 10:
+            if epoch >= 50:
                 if (epoch - 10) % 1 == 0 or force_mining_next_epoch:
                     print(f"🔍 Mining Global Hard Negatives using cached embeddings...")
                     epoch_hn_pool = mine_global_hard_negatives(
                         norm_item_embeddings, # 다시 계산 안 하고 캐시본 사용
-                        exclusion_top_k=5, 
-                        mine_k=100, 
+                        exclusion_top_k=2, 
+                        mine_k=150, 
                         batch_size=2048, 
                         device=device
                     )
@@ -3749,9 +2882,9 @@ def resume_pipeline_session_weights():
             hn_scheduler=hn_scheduler,
             T_sample =  T_sample,
             beta= current_beta,
-            hn_refresh_interval=200,      # N배치마다 pool 재갱신
-            hn_exclusion_top_k=5,         # mining 파라미터 직접 전달
-            hn_mine_k=100,
+            hn_refresh_interval=0,      # N배치마다 pool 재갱신
+            hn_exclusion_top_k=2,         # mining 파라미터 직접 전달
+            hn_mine_k=150,
             seq_labels=SEQ_LABELS,
             static_labels=STATIC_LABELS,
         )
@@ -3810,13 +2943,12 @@ def train_pipeline_from_scratch():
     """
     print("🚀 Starting User Tower Training Pipeline (From Scratch + Delayed HNM)...")
     
-    SEQ_LABELS = ['item_id', 'recency_curr', 'week_curr', 'item_type', 'target_week']
+    SEQ_LABELS = [ 'recency_curr', 'week_curr', 'item_id','item_price', 'target_week']
     STATIC_LABELS = [
         'age', 'price',
         'channel', 'club', 'news', 'fn', 'active',
         'cont_price_std', 'cont_last_diff', 'cont_repurch', 'cont_weekend'
     ] 
-    
     # 1. Config & Env
     cfg = PipelineConfig()
     device = setup_environment()
@@ -3832,8 +2964,8 @@ def train_pipeline_from_scratch():
     cfg.soft_penalty_weigh = 1.0
     cfg.hn_scheduled = False
     cfg.batch_size = 512
-    cfg.dropout = 0.3
-    FREEZE_ITEM_EPOCHS = 4
+    cfg.dropout = 0.25
+    FREEZE_ITEM_EPOCHS = 1
     HASH_SIZE = 1000
     cfg.num_prod_types = HASH_SIZE
     cfg.num_colors = HASH_SIZE
@@ -3863,8 +2995,8 @@ def train_pipeline_from_scratch():
     # -----------------------------------------------------------
     user_tower, item_tower = setup_models(cfg, device, None, log_q_tensor) 
     
-    save_user_pth = os.path.join(cfg.model_dir, "best_user_tower_from_scratch_session_last.pth")
-    save_item_pth = os.path.join(cfg.model_dir, "best_item_tower_from_scratch_session_last.pth")
+    save_user_pth = os.path.join(cfg.model_dir, "best_user_tower_from_scratch_session_last_feature.pth")
+    save_item_pth = os.path.join(cfg.model_dir, "best_item_tower_from_scratch_session_last_feature.pth")
     item_tower.init_from_pretrained(aligned_vecs.to(device))
     print(f"❄️ Item Tower is Frozen for the first {FREEZE_ITEM_EPOCHS} epochs.")
     item_tower.set_freeze_state(True)
@@ -3900,7 +3032,7 @@ def train_pipeline_from_scratch():
     
     force_mining_next_epoch = False
     epoch_hn_pool = None
-    
+    current_beta = 0.15
     # -----------------------------------------------------------
     # 4. Training Loop (Epoch 1부터 시작)
     # -----------------------------------------------------------
@@ -3911,14 +3043,29 @@ def train_pipeline_from_scratch():
             print(f"🔥 Epoch {epoch}: Unfreezing Item Tower for Joint Training!")
             item_tower.set_freeze_state(False)
         
+        
+        if epoch == 10:
+            print(f"📈 [Epoch {epoch}] Increasing Item Tower LR multiplier from 0.05x to 0.15x!")
+            new_item_base_lr = cfg.lr * 0.15
+            
+            # param_groups[0]: user_tower / param_groups[1]: item_tower
+            optimizer.param_groups[1]['initial_lr'] = new_item_base_lr
+            
+            # 스케줄러가 계산의 기준으로 삼는 base_lrs도 업데이트 (매우 중요!)
+            if hasattr(scheduler, 'base_lrs'):
+                scheduler.base_lrs[1] = new_item_base_lr
+        
+        
         item_tower.eval()
+        
+ 
         with torch.no_grad():
             print(f"📦 [Epoch {epoch}] Caching All Item Embeddings for Training...")
             all_item_embs = item_tower.get_all_embeddings()
             norm_item_embeddings = F.normalize(all_item_embs, p=2, dim=1) # [50000, Dim]
             
             # 10에포크부터는 이 캐시된 임베딩을 마이닝에도 재사용하여 속도 극대화
-            if epoch >= 10:
+            if epoch >= 14:
                 if (epoch - 10) % 1 == 0 or force_mining_next_epoch:
                     print(f"🔍 Mining Global Hard Negatives using cached embeddings...")
                     epoch_hn_pool = mine_global_hard_negatives(
@@ -3946,8 +3093,11 @@ def train_pipeline_from_scratch():
         current_lr = scheduler.get_last_lr()[0]
         print(f"Epoch [{epoch}/{cfg.epochs}]  - Current LR: {current_lr:.8f}")
         
+     
+        
+        T_sample = max(0.25, 0.5 - (epoch - 14) * 0.025)
         # ------------------- 훈련 (Train) -------------------
-        avg_loss, force_mining_next_epoch = train_user_tower_session_sampler_with_intent_point(
+        avg_loss, force_mining_next_epoch, avg_discard_ratio = train_user_tower_session_sampler_with_intent_point(
             epoch=epoch,
             
             model=user_tower,
@@ -3962,14 +3112,31 @@ def train_pipeline_from_scratch():
             hard_neg_pool_tensor=epoch_hn_pool, # Epoch 1~9는 None, 10부터 텐서 주입
             scheduler=scheduler, 
             hn_scheduler=hn_scheduler,
+            T_sample =  T_sample,
+            beta= current_beta,
+            hn_refresh_interval=0,      # N배치마다 pool 재갱신
+            hn_exclusion_top_k=2,         # mining 파라미터 직접 전달
+            hn_mine_k=150,
             seq_labels=SEQ_LABELS,
             static_labels=STATIC_LABELS,
         )
         del norm_item_embeddings
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        #prev_ex_top_k = hn_scheduler.ex_top_k if hn_scheduler else cfg.EX_TOP_K
         
+        # Beta curriculum
+        if avg_discard_ratio < 0.25:
+            current_beta = 0.15
+        elif avg_discard_ratio < 0.40:
+            current_beta = 0.20
+        else:
+            current_beta = 0.25
+
+        print(f"📊 [Epoch {epoch}] avg_discard_ratio={avg_discard_ratio:.3f} "
+              f"→ next beta={current_beta:.2f}, T_sample={T_sample:.3f}")
         # ------------------- 평가 (Evaluate) -------------------
+        
         val_metrics = evaluate_model(
             model=user_tower, 
             item_tower=item_tower, 
@@ -3990,10 +3157,10 @@ def train_pipeline_from_scratch():
             torch.save(user_tower.state_dict(), save_user_pth)
             torch.save(item_tower.state_dict(), save_item_pth)
             print(f"   💾 Best model weights saved to: {save_user_pth}")
-        if epoch == 9:
+        if epoch == 13:
             print(f"🔔 [Checkpoint] Epoch {epoch} completed. Current Recall@20: {current_recall_20:.2f}%")
-            base_user_pth =os.path.join(cfg.model_dir, "best_user_tower_from_scratch_base_512.pth")
-            base_item_pth= os.path.join(cfg.model_dir, "best_item_tower_from_scratch_base_512.pth")
+            base_user_pth =os.path.join(cfg.model_dir, "best_user_tower_from_scratch_base_feature.pth")
+            base_item_pth= os.path.join(cfg.model_dir, "best_item_tower_from_scratch_base_feature.pth")
             
             torch.save(user_tower.state_dict(), base_user_pth)
             torch.save(item_tower.state_dict(), base_item_pth)
@@ -4013,6 +3180,6 @@ if __name__ == "__main__":
     #mp.freeze_support()
     mp.set_start_method('spawn', force=True)  # Windows 필수
     
-    resume_pipeline_session_weights()
+    #resume_pipeline_session_weights()
     #run_resume_pipeline_v2()
-    #train_pipeline_from_scratch()
+    train_pipeline_from_scratch()

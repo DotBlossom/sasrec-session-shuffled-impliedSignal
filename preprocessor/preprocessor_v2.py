@@ -228,7 +228,8 @@ def make_user_features_v3(train_df, target_val_path, USER_META_PATH, USER_FEAT_V
     # 3️⃣ 실제 컬럼 생성 (이게 있어야 KeyError가 안 납니다!)
     train_df['sequence_deltas'] = (user_max_day - train_df['days_int']).astype(np.int32)
     dynamic_cols = [
-        'article_id','sequence_deltas',   # 👈 시간 간격 시퀀스 (추가됨)
+        'article_id','sequence_deltas', 
+        'price',     # 👈 시간 간격 시퀀스 (추가됨)
         'asof_avg_price_bucket', 'asof_total_cnt_bucket', 'asof_recency_bucket',
         'asof_price_std_scaled', 'asof_last_price_diff_scaled', 'asof_repurchase_ratio_scaled', 'asof_weekend_ratio_scaled',
         'asof_preferred_channel', 'asof_t_dat_ordinal', 'asof_current_week' # 타임 변수 추가

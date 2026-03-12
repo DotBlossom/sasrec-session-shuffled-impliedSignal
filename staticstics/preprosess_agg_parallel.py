@@ -871,10 +871,10 @@ if __name__ == "__main__":
     
     # save 장소 
     
-    USER_FEAT_PATH_v2_PQ = os.path.join(BASE_DIR, "features_user_w_meta_nonleak.parquet")
-    USER_FEAT_VAL_PATH_v2_PQ = os.path.join(BASE_DIR, "features_user_w_meta_nonleak_val.parquet")
+    USER_FEAT_PATH_v2_PQ = os.path.join(BASE_DIR, "features_user_w_meta_nonleak_v2.parquet")
+    USER_FEAT_VAL_PATH_v2_PQ = os.path.join(BASE_DIR, "features_user_w_meta_nonleak_val_v2.parquet")
     
-    make_user_features_v3(train_only_df,TARGET_VAL_PATH, USER_META_PATH, USER_FEAT_VAL_PATH_v2_PQ)
+    make_user_features_v3(train_only_df,None, USER_META_PATH, USER_FEAT_PATH_v2_PQ)
     
     #TARGET_VAL_PATH
     # 2. Validation용 정답지 먼저 생성 (이건 full_df가 필요함)
