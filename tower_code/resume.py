@@ -1286,7 +1286,7 @@ def mine_category_constrained_hard_negatives(item_embs, category_tensor, k=5, de
         
     return hard_neg_pool        
 
-def mine_global_hard_negatives(item_embs, exclusion_top_k=50, mine_k=5, batch_size=2048, device='cuda'):
+def mine_global_hard_negatives_manual(item_embs, exclusion_top_k=50, mine_k=5, batch_size=2048, device='cuda'):
     """
     에포크 시작 시 호출. 카테고리 제약 없이 전체 아이템 풀에서 하드 네거티브를 추출합니다.
     진짜 정답일 확률이 높은 Top-K(exclusion_top_k)는 배제하고, 그 다음 순위에서 mine_k개를 뽑습니다.
@@ -1336,13 +1336,152 @@ def mine_global_hard_negatives(item_embs, exclusion_top_k=50, mine_k=5, batch_si
         hard_neg_pool[i:end_i] = hard_negs
         
     return hard_neg_pool
+def mine_global_hard_negatives(
+    item_embs, sbert_embs, 
+    fn_threshold=0.85,   # 상한: FN 제거
+    fn_lower=0.50,       # 하한: easy negative 제거 (None이면 미적용)
+    exclusion_top_k=5,
+    mine_k=150, 
+    batch_size=2048,
+    device='cuda'
+):
+    num_items = item_embs.size(0)
+    hard_neg_pool = torch.zeros((num_items, mine_k), dtype=torch.long, device=device)
 
+    total_masked_upper  = 0   # FN 마스킹 (상한)
+    total_masked_lower  = 0   # easy negative 마스킹 (하한)
+    total_available     = 0
+
+    shield_label = f"S-BERT >= {fn_threshold} masked"
+    if fn_lower is not None:
+        shield_label += f", < {fn_lower} masked"
+    print(f"🔍 Mining Hard Negatives with Semantic Shield ({shield_label})...")
+
+    for i in range(0, num_items, batch_size):
+        end_i     = min(i + batch_size, num_items)
+        batch_len = end_i - i
+
+        batch_model_embs = item_embs[i:end_i]
+        batch_sbert_embs = sbert_embs[i:end_i]
+
+        sim_matrix   = torch.matmul(batch_model_embs, item_embs.T)  # [B, N]
+        semantic_sim = torch.matmul(batch_sbert_embs, sbert_embs.T) # [B, N]
+
+        # ── 상한 마스킹: FN 제거 (기존) ───────────────────────
+        upper_mask = semantic_sim >= fn_threshold                    # [B, N]
+        batch_n_masked_upper = upper_mask.sum().item()
+
+        # ── 하한 마스킹: easy negative 제거 (신규) ────────────
+        if fn_lower is not None:
+            lower_mask = semantic_sim < fn_lower                     # [B, N]
+            batch_n_masked_lower = lower_mask.sum().item()
+        else:
+            lower_mask = None
+            batch_n_masked_lower = 0
+
+        # ── 통계 누적 ──────────────────────────────────────────
+        total_masked_upper += batch_n_masked_upper
+        total_masked_lower += batch_n_masked_lower
+
+        total_n_masked = batch_n_masked_upper + batch_n_masked_lower
+        masked_per_item    = total_n_masked / batch_len
+        available_per_item = num_items - masked_per_item - 2  # 자기자신 + padding
+        total_available   += max(available_per_item, 0) * batch_len
+
+        # ── 마스킹 적용 ────────────────────────────────────────
+        sim_matrix.masked_fill_(upper_mask, -float('inf'))
+        if lower_mask is not None:
+            sim_matrix.masked_fill_(lower_mask, -float('inf'))
+
+        # 자기자신 / padding 마스킹
+        batch_indices = torch.arange(i, end_i, device=device)
+        sim_matrix[torch.arange(batch_len, device=device), batch_indices] = -float('inf')
+        sim_matrix[:, 0] = -float('inf')
+
+        # ── Top-K 추출 ─────────────────────────────────────────
+        total_k = min(exclusion_top_k + mine_k, num_items - 1)
+        _, topk_indices_global = torch.topk(sim_matrix, total_k, dim=1)
+        hard_negs = topk_indices_global[:, exclusion_top_k: exclusion_top_k + mine_k]
+
+        if hard_negs.size(1) < mine_k:
+            pad_size  = mine_k - hard_negs.size(1)
+            pad_idx   = hard_negs[:, [0]].expand(-1, pad_size)
+            hard_negs = torch.cat([hard_negs, pad_idx], dim=1)
+
+        hard_neg_pool[i:end_i] = hard_negs
+
+    # ── 최종 통계 ──────────────────────────────────────────────
+    n_sq = num_items * num_items + 1e-9
+
+    shield_metrics = {
+        # 상한 마스킹 비율 (FN 제거)
+        'HNM/sbert_mask_ratio_upper':      total_masked_upper / n_sq,
+        'HNM/sbert_masked_per_item_upper': total_masked_upper / (num_items + 1e-9),
+
+        # 하한 마스킹 비율 (easy negative 제거)
+        'HNM/sbert_mask_ratio_lower':      total_masked_lower / n_sq,
+        'HNM/sbert_masked_per_item_lower': total_masked_lower / (num_items + 1e-9),
+
+        # 전체 마스킹 비율
+        'HNM/sbert_mask_ratio_total':      (total_masked_upper + total_masked_lower) / n_sq,
+
+        # 아이템당 실제 유효 후보 수 (mine_k 대비 충분한지 확인)
+        'HNM/available_per_item':          total_available / (num_items + 1e-9),
+    }
+
+    return hard_neg_pool, shield_metrics
+def mine_global_hard_negatives_PRRT(item_embs, sbert_embs, fn_threshold=0.85, exclusion_top_k=5, mine_k=150, batch_size=2048, device='cuda'):
+
+    num_items = item_embs.size(0)
+    hard_neg_pool = torch.zeros((num_items, mine_k), dtype=torch.long, device=device)
+    
+    print(f"🔍 Mining Hard Negatives with Semantic Shield (S-BERT >= {fn_threshold} masked)...")
+
+    for i in range(0, num_items, batch_size):
+        end_i = min(i + batch_size, num_items)
+        
+        # [Batch, dim]
+        batch_model_embs = item_embs[i:end_i] 
+        batch_sbert_embs = sbert_embs[i:end_i]
+        
+        # 1. 모델 임베딩 공간의 유사도 계산 (누구를 오답으로 뽑을 것인가?)
+        sim_matrix = torch.matmul(batch_model_embs, item_embs.T) # [Batch, num_items]
+        
+        # 2. 💡 [핵심] 시맨틱 방어막(Semantic Shield) 계산 및 마스킹
+        # 현재 배치의 S-BERT 벡터와 전체 아이템의 S-BERT 벡터 간의 절대 유사도 계산
+        semantic_sim_matrix = torch.matmul(batch_sbert_embs, sbert_embs.T)
+        
+        # S-BERT 기준 0.85 이상인 대체재들은 모델 공간에서 -inf로 강제 마스킹!
+        sim_matrix.masked_fill_(semantic_sim_matrix >= fn_threshold, -float('inf'))
+        
+        # 3. 기본 마스킹: 자기 자신 및 패딩(0번 인덱스) 제외
+        batch_indices = torch.arange(i, end_i, device=device)
+        sim_matrix[torch.arange(end_i - i, device=device), batch_indices] = -float('inf')
+        sim_matrix[:, 0] = -float('inf') # 0번 인덱스(패딩)가 오답으로 뽑히지 않도록 영구 제외
+        
+        # 4. Top-K 추출 (모델 공간에서 가까운 순서대로)
+        total_k = min(exclusion_top_k + mine_k, num_items - 1)
+        _, topk_indices_global = torch.topk(sim_matrix, total_k, dim=1)
+        
+        # 5. 모델 오류(Model Collapse) 대비용 최소한의 exclusion_top_k만 건너뛰고 채굴
+        # (이미 완벽한 시맨틱 대체재는 날아갔으므로, exclusion_top_k를 5~10 수준으로 낮춰도 무방합니다)
+        hard_negs = topk_indices_global[:, exclusion_top_k : exclusion_top_k + mine_k]
+        
+        # 예외 처리 (수량 부족 시 패딩)
+        if hard_negs.size(1) < mine_k:
+            pad_size = mine_k - hard_negs.size(1)
+            pad_idx = hard_negs[:, [0]].expand(-1, pad_size)
+            hard_negs = torch.cat([hard_negs, pad_idx], dim=1)
+            
+        hard_neg_pool[i:end_i] = hard_negs
+        
+    return hard_neg_pool
 import torch
 import torch.nn.functional as F
 
 
 
-def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
+def inbatch_corrected_logq_loss_with_hybrid_hard_neg_prev22(
     user_emb, seq_item_emb, target_ids, user_ids, log_q_tensor,
     hn_item_emb=None, batch_hard_neg_ids=None,item_embedding_weight=None,
     flat_history_item_ids=None,
@@ -1354,6 +1493,7 @@ def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
     T_HN=0.14,
     beta=0.25,
     T_sample=0.5, 
+    boundary_ratio=0.85,
     return_metrics=False
 ):
     N = user_emb.size(0)
@@ -1402,10 +1542,11 @@ def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
 
     if hn_item_emb is not None and batch_hard_neg_ids is not None:
         #pool_multiplier = 2
-        num_pool = int(num_hn_to_use * 1.4)
+        num_pool = int(num_hn_to_use * 3.5)
         #num_pool = num_hn_to_use * pool_multiplier
         #skip_top_k = 5
-        boundary_ratio = 0.85
+        #avg_pos_sim = pos_sim.detach().mean().item()
+
 
         # [STEP 1] Gradient 없이 HN 후보 필터링 & 선택
         with torch.no_grad():
@@ -1559,6 +1700,173 @@ def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
         return loss, metrics
 
     return loss
+
+
+def inbatch_corrected_logq_loss_with_hybrid_hard_neg(
+    user_emb, seq_item_emb, target_ids, user_ids, log_q_tensor,
+    hn_item_emb=None, batch_hard_neg_ids=None,item_embedding_weight=None,
+    flat_history_item_ids=None,
+    step_weights=None,
+    temperature=0.07,
+    lambda_logq=1.0,
+    margin=0.00,
+    T_HN=0.14,
+    beta=0.25,
+    T_sample=0.5, 
+    boundary_ratio=0.85, # (더 이상 내부 마스킹에 사용하지 않음)
+    return_metrics=False
+):
+    N = user_emb.size(0)
+    device = user_emb.device
+    SAFE_NEG_INF = -1e9
+
+    # -----------------------------------------------------------
+    # 0. 가중치 준비
+    # -----------------------------------------------------------
+    if step_weights is not None:
+        step_weights = torch.as_tensor(step_weights, device=device, dtype=torch.float32)
+        weight_sum = step_weights.sum() + 1e-9
+    else:
+        weight_sum = None
+
+    # -----------------------------------------------------------
+    # 1. In-batch Logits 계산
+    # -----------------------------------------------------------
+    sim_matrix = torch.matmul(user_emb, seq_item_emb.T)  # [N, N]
+    pos_sim = torch.diagonal(sim_matrix)                  # [N]
+    labels = torch.arange(N, device=device)
+    logits = sim_matrix / temperature
+
+    if margin > 0.0:
+        logits[labels, labels] -= (margin / temperature)
+
+    if lambda_logq > 0.0:
+        batch_log_q = log_q_tensor[target_ids]
+        logits = logits - (batch_log_q.view(1, -1) * lambda_logq)
+
+    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
+    same_item_mask = torch.eq(target_ids.unsqueeze(1), target_ids.unsqueeze(0))
+    same_user_mask = torch.eq(user_ids.unsqueeze(1), user_ids.unsqueeze(0))
+    false_neg_mask = (same_item_mask | same_user_mask) & ~diag_mask
+    logits = logits.masked_fill(false_neg_mask, SAFE_NEG_INF)
+    logits = torch.clamp(logits, min=SAFE_NEG_INF, max=1e4)
+
+    metrics = {}
+
+    # -----------------------------------------------------------
+    # 2. Hard Negative Mining & MNS Loss 계산
+    # -----------------------------------------------------------
+    num_hn_to_use = 40
+    loss_hn = None
+
+    if hn_item_emb is not None and batch_hard_neg_ids is not None:
+        num_pool = int(num_hn_to_use * 3.5)
+
+        # [STEP 1] Gradient 없이 HN 후보 필터링 & 선택
+        with torch.no_grad():
+            hn_emb_no_grad = hn_item_emb.detach()
+            hn_sim_no_grad = torch.bmm(
+                user_emb.unsqueeze(1),
+                hn_emb_no_grad.transpose(1, 2)
+            ).squeeze(1)  # [N, pool_size]
+
+            # 💡 [유지] Absolute FN 마스크: 유저가 이미 클릭했던(히스토리) 아이템 제외
+            final_fn_mask = torch.zeros_like(hn_sim_no_grad, dtype=torch.bool)
+            if flat_history_item_ids is not None:
+                final_fn_mask = (
+                    batch_hard_neg_ids.unsqueeze(2) == flat_history_item_ids.unsqueeze(1)
+                ).any(dim=2)
+
+            # 🚀 [삭제] dynamic_boundary 마스킹 삭제 완료! (S-BERT가 이미 일함)
+            masked_sims = hn_sim_no_grad.masked_fill(final_fn_mask, -1e4)
+            
+            
+            # 가장 유사한 skip_top_k개는 버리고, 그 다음부터 num_pool개만큼 가져옵니다.
+            _, top_idx_pool = torch.topk(masked_sims, num_pool, dim=1)
+            pool_sims = torch.gather(masked_sims, 1, top_idx_pool)
+
+            # Step B. 하드니스 점수를 확률로 변환 (T_sample로 exploration 조절)
+            sampling_weights = F.softmax(pool_sims / T_sample, dim=1)  # [N, num_pool]
+
+            # Step C. 가중치 비례 비복원 추출 (multinomial)
+            top_idx_local = torch.multinomial(
+                sampling_weights,
+                num_samples=num_hn_to_use,
+                replacement=False
+            )  # [N, num_hn_to_use]
+            
+            # 글로벌 인덱스 복구
+            top_idx = torch.gather(top_idx_pool, 1, top_idx_local)  # [N, num_hn_to_use]
+
+        # [STEP 2] 선택된 인덱스로 live item_tower에서 직접 임베딩 조립
+        batch_hn_ids_final = torch.gather(batch_hard_neg_ids, 1, top_idx)  # [N, num_hn]
+
+        if item_embedding_weight is not None:
+            hn_emb_flat = item_embedding_weight[batch_hn_ids_final.view(-1)]
+            hn_emb_final = F.normalize(hn_emb_flat, p=2, dim=1).view(
+                batch_hn_ids_final.size(0), batch_hn_ids_final.size(1), -1
+            )  # [N, num_hn, D]
+        else:
+            top_idx_expanded = top_idx.unsqueeze(-1).expand(-1, -1, hn_item_emb.size(2))
+            hn_emb_final = torch.gather(hn_item_emb, 1, top_idx_expanded).detach()
+        
+        # [STEP 3] HN similarity 계산
+        hn_sim = torch.bmm(
+            user_emb.unsqueeze(1),
+            hn_emb_final.transpose(1, 2)
+        ).squeeze(1)  # [N, num_hn]
+
+        # 🚀 [삭제] final_safety_mask 도 제거 (이미 깨끗한 풀이므로 안심하고 때림)
+        
+        # [MNS] HN loss 계산
+        hn_loss_input = torch.cat([
+            pos_sim.unsqueeze(1) / T_HN,   # [N, 1] (정답)
+            hn_sim / T_HN                  # [N, num_hn] (오답들)
+        ], dim=1)  
+        
+        hn_loss_input = torch.clamp(hn_loss_input, min=SAFE_NEG_INF, max=1e4)
+        hn_labels = torch.zeros(N, dtype=torch.long, device=device)
+
+        if step_weights is not None:
+            loss_hn = F.cross_entropy(hn_loss_input, hn_labels, reduction='none')
+            loss_hn = (loss_hn * step_weights).sum() / weight_sum
+        else:
+            loss_hn = F.cross_entropy(hn_loss_input, hn_labels)
+
+        # Metrics 기록
+        if return_metrics:
+            metrics['sim/hn_true_hard'] = hn_sim.mean().item() if hn_sim.numel() > 0 else 0.0
+            
+            with torch.no_grad():
+                max_hn_per_user, _ = hn_sim.max(dim=1)
+                metrics['sim/hn_max_mean'] = max_hn_per_user.mean().item() if max_hn_per_user.numel() > 0 else 0.0
+
+    # -----------------------------------------------------------
+    # 3. In-batch Loss 계산
+    # -----------------------------------------------------------
+    if step_weights is not None:
+        loss_inbatch = F.cross_entropy(logits, labels, reduction='none')
+        loss_inbatch = (loss_inbatch * step_weights).sum() / weight_sum
+        if return_metrics:
+            metrics['sim/pos'] = ((pos_sim * step_weights).sum() / weight_sum).item()
+    else:
+        loss_inbatch = F.cross_entropy(logits, labels)
+        if return_metrics:
+            metrics['sim/pos'] = pos_sim.mean().item()
+
+    # -----------------------------------------------------------
+    # 4. 최종 Loss 조합 (In-batch + MNS HN)
+    # -----------------------------------------------------------
+    if loss_hn is not None:
+        loss = loss_inbatch + beta * loss_hn
+        if return_metrics:
+            metrics['loss/inbatch'] = loss_inbatch.item()
+            metrics['loss/hn'] = loss_hn.item()
+            metrics['loss/hn_ratio'] = (beta * loss_hn).item() / (loss_inbatch.item() + 1e-9)
+    else:
+        loss = loss_inbatch
+
+    return loss if not return_metrics else (loss, metrics)
 # =====================================================================
 # Phase 2: Data Preparation
 # =====================================================================
@@ -2303,7 +2611,7 @@ def train_user_tower_session_sampler_with_intent_point(epoch, model, item_tower,
     
     current_hn_pool = hard_neg_pool_tensor
     current_norm_item_embs = norm_item_embeddings
-    print(beta)
+
     #prefetch_loader = CUDAPrefetcher(dataloader, device)  
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
     
@@ -2691,6 +2999,670 @@ def train_user_tower_session_sampler_with_intent_point(epoch, model, item_tower,
 
     print(f"🏁 Epoch {epoch} Completed | Avg Total: {avg_loss:.4f} (Main: {avg_main:.4f}, CL: {avg_cl:.4f})")
     return avg_loss, force_mining_next_epoch,  avg_discard_ratio
+import torch
+import torch.nn.functional as F
+import wandb
+import pandas as pd
+from collections import Counter
+from tqdm import tqdm
+
+def run_diagnostic_analysis(
+    user_embs,               # [Num_Users, Dim] : 평가셋의 유저 벡터 (Session-last)
+    item_embs,               # [Num_Items, Dim] : 전체 아이템 벡터
+    target_dict,             # dict: user_id -> target_item_ids
+    user_ids,                # list: user_embs와 인덱스가 매칭되는 user_id 리스트
+    item_id_to_category,     # dict: item_id -> product_type_name (예: 'T-shirt')
+    device='cuda'
+):
+    print("\n" + "="*60)
+    print("🕵️‍♂️ Starting Diagnostic Analysis (Phase 1 & 2)")
+    print("="*60)
+    
+    # 임베딩 정규화
+    user_embs = F.normalize(user_embs.to(device), p=2, dim=1)
+    item_embs = F.normalize(item_embs.to(device), p=2, dim=1)
+    
+    num_items = item_embs.size(0)
+    
+    # -----------------------------------------------------------
+    # Phase 1. 임베딩 지형 분석 (Isotropy & Category Variance)
+    # -----------------------------------------------------------
+    print("📊 [Phase 1] Analyzing Item Embedding Topology...")
+    
+    # 1-1. Global Uniformity (전체 아이템 랜덤 1만 쌍 유사도)
+    idx1 = torch.randint(0, num_items, (10000,), device=device)
+    idx2 = torch.randint(0, num_items, (10000,), device=device)
+    global_sims = (item_embs[idx1] * item_embs[idx2]).sum(dim=1)
+    
+    wandb.log({"Analysis/Global_Item_Similarity": wandb.Histogram(global_sims.cpu().numpy())})
+    print(f"   -> Global Sim Mean: {global_sims.mean().item():.4f}")
+
+    # 1-2. Intra-Category Similarity (같은 카테고리 내 아이템들끼리의 유사도)
+    # 메모리를 위해 카테고리별로 샘플링하여 계산
+    intra_sims = []
+    category_to_item_ids = {} # { 'T-shirt': [1, 5, 12...], ... }
+    for iid, cat in item_id_to_category.items():
+        if cat not in category_to_item_ids: category_to_item_ids[cat] = []
+        category_to_item_ids[cat].append(iid)
+        
+    for cat, ids in category_to_item_ids.items():
+        if len(ids) > 10: # 아이템이 충분히 있는 카테고리만
+            ids_tensor = torch.tensor(ids, device=device)
+            # 카테고리 내 랜덤 200쌍 추출
+            c_idx1 = ids_tensor[torch.randint(0, len(ids), (200,))]
+            c_idx2 = ids_tensor[torch.randint(0, len(ids), (200,))]
+            sims = (item_embs[c_idx1] * item_embs[c_idx2]).sum(dim=1)
+            intra_sims.append(sims)
+            
+    if intra_sims:
+        intra_sims_tensor = torch.cat(intra_sims)
+        wandb.log({"Analysis/Intra_Category_Similarity": wandb.Histogram(intra_sims_tensor.cpu().numpy())})
+        print(f"   -> Intra-Category Sim Mean: {intra_sims_tensor.mean().item():.4f}")
+
+    # -----------------------------------------------------------
+    # Phase 2. Error Analysis (R@100 성공, R@10 실패 케이스)
+    # -----------------------------------------------------------
+    print("🔍 [Phase 2] Extracting Error Cases (R@100 Hit, R@10 Miss)...")
+    
+    # WandB Table 초기화
+    error_table = wandb.Table(columns=[
+        "User ID", "Target Category", "Predicted Top 1-3 Categories", 
+        "Top 10 Category Dist.", "Target Rank"
+    ])
+    
+    # 점수 계산 (배치로 처리 권장하나, 분석용이므로 간단히 행렬 곱)
+    scores = torch.matmul(user_embs, item_embs.T)
+    _, top100_indices = torch.topk(scores, k=100, dim=-1)
+    top100_preds = top100_indices.cpu().numpy()
+    
+    error_count = 0
+    max_log_cases = 100 # WandB 테이블에 너무 많이 올라가는 것 방지
+    
+    for i, u_id in enumerate(tqdm(user_ids, desc="Scanning Users")):
+        if error_count >= max_log_cases: break
+        
+        # 💡 [수정됨] NumPy/List Array의 길이를 검사하도록 변경
+        if u_id not in target_dict or len(target_dict[u_id]) == 0: 
+            continue
+        
+        # 💡 [수정됨] Target이 단일 스칼라값인지 반복 가능한 배열인지 안전하게 처리
+        raw_targets = target_dict[u_id]
+        if isinstance(raw_targets, str) or not hasattr(raw_targets, '__iter__'):
+            raw_targets = [raw_targets]
+            
+        target_id = raw_targets[0] # 첫 번째 정답 아이템 기준
+        target_cat = item_id_to_category.get(target_id, "Unknown")
+        
+        preds = top100_preds[i]
+        
+        if target_id in preds:
+            # np.where를 안전하게 사용하기 위해 list로 변환하여 index 탐색
+            rank = list(preds).index(target_id) + 1
+            
+            if 10 < rank <= 100:
+                top10_ids = preds[:10]
+                top10_cats = [item_id_to_category.get(iid, "Unknown") for iid in top10_ids]
+                
+                top3_str = " | ".join(top10_cats[:3])
+                cat_dist = str(dict(Counter(top10_cats)))
+                
+                error_table.add_data(
+                    str(u_id), target_cat, top3_str, cat_dist, rank
+                )
+                error_count += 1
+
+    wandb.log({"Analysis/Retrieval_Error_Notes": error_table})
+    print(f"   -> Logged {error_count} error cases to WandB Table.")
+    print("="*60 + "\n")
+    
+import torch
+import torch.nn.functional as F
+import wandb
+import numpy as np
+from tqdm import tqdm
+
+def find_optimal_hnm_boundary_via_metadata(
+    item_embs,               # [Num_Items, Dim] : 학습된 아이템 임베딩
+    item_metadata_dict,      # dict: item_id -> {"MAT": [...], "CAT": [...], "DET": [...]}
+    device='cuda',
+    jaccard_threshold=0.75   # "이 정도 속성이 겹치면 사실상 같은 옷(FN)이다"의 기준
+):
+    print("\n" + "="*70)
+    print("🔍 [Phase 3] Metadata-based False Negative Boundary Measurement")
+    print("="*70)
+    
+    item_embs = F.normalize(item_embs.to(device), p=2, dim=1)
+    num_items = item_embs.size(0)
+    
+    # 1. 아이템별 속성 Set 구축
+    item_sets = {}
+    for iid, meta in item_metadata_dict.items():
+        # MAT, CAT, DET를 하나의 1차원 Set으로 병합
+        attributes = set()
+        for key in ["MAT", "CAT", "DET"]:
+            if key in meta and isinstance(meta[key], list):
+                # 소문자로 통일하여 텍스트 정규화
+                attributes.update([str(v).strip().lower() for v in meta[key]])
+        item_sets[iid] = attributes
+        
+    valid_ids = list(item_sets.keys())
+    
+    # 2. 샘플링을 통한 상관관계 분석 (VRAM 고려 2,000개 아이템만 샘플링)
+    sample_size = min(2000, len(valid_ids))
+    sample_ids = np.random.choice(valid_ids, sample_size, replace=False)
+    sample_idx_tensor = torch.tensor(sample_ids, device=device)
+    
+    sample_embs = item_embs[sample_idx_tensor]
+    
+    # 임베딩 코사인 유사도 행렬 계산 [2000, 2000]
+    latent_sim_matrix = torch.matmul(sample_embs, sample_embs.T).cpu().numpy()
+    
+    fn_latent_sims = [] # 자카드 유사도가 높은(FN) 쌍들의 임베딩 유사도 보관
+    hn_latent_sims = [] # 자카드 유사도가 중간(HN) 쌍들의 임베딩 유사도 보관
+    
+    print("⏳ Calculating Jaccard Similarities and Mapping to Latent Space...")
+    for i in tqdm(range(sample_size)):
+        set_A = item_sets[sample_ids[i]]
+        if not set_A: continue
+            
+        for j in range(i+1, sample_size):
+            set_B = item_sets[sample_ids[j]]
+            if not set_B: continue
+                
+            # 자카드 유사도 계산 (교집합 / 합집합)
+            intersection = len(set_A.intersection(set_B))
+            union = len(set_A.union(set_B))
+            jaccard_sim = intersection / union if union > 0 else 0
+            
+            latent_sim = latent_sim_matrix[i, j]
+            
+            # 통계 수집
+            if jaccard_sim >= jaccard_threshold:
+                # 메타데이터 상 "거의 같은 옷" (False Negative)
+                fn_latent_sims.append(latent_sim)
+            elif 0.3 <= jaccard_sim < jaccard_threshold:
+                # 카테고리 정도만 겹치는 "적절한 오답" (Hard Negative)
+                hn_latent_sims.append(latent_sim)
+                
+    # 3. 통계 결과 출력 및 최적 Boundary 제안
+    fn_sims = np.array(fn_latent_sims)
+    hn_sims = np.array(hn_latent_sims)
+    
+    print("\n📊 [Statistical Report]")
+    print(f"  - 👗 사실상 동일 아이템 (Jaccard >= {jaccard_threshold}) 쌍 개수: {len(fn_sims)}")
+    print(f"  - 👖 적절한 헷갈림 오답 (0.3 <= Jaccard < {jaccard_threshold}) 쌍 개수: {len(hn_sims)}")
+    
+    if len(fn_sims) > 0:
+        fn_mean = fn_sims.mean()
+        # 하위 10% 백분위수를 경계로 삼음 (보수적 접근)
+        optimal_boundary = np.percentile(fn_sims, 10) 
+        
+        print(f"\n💡 [Actionable Insight]")
+        print(f"  - 사실상 동일한 옷들은 모델 임베딩 공간에서 평균적으로 [ {fn_mean:.4f} ] 의 코사인 유사도를 가집니다.")
+        print(f"  - 따라서 HNM 진행 시, 모델 유사도가 [ {optimal_boundary:.4f} ] 이상인 아이템들은 오답으로 때리지 말고 무시(Skip)해야 합니다!")
+        print(f"  - 🚀 추천 세팅: cfg.boundary_ratio = {optimal_boundary:.4f} (또는 dynamic boundary 계산 시 활용)")
+        
+        # WandB 로깅
+        wandb.log({
+            "HNM_Analysis/False_Negative_Latent_Sims": wandb.Histogram(fn_sims),
+            "HNM_Analysis/Hard_Negative_Latent_Sims": wandb.Histogram(hn_sims),
+            "HNM_Analysis/Suggested_Boundary": optimal_boundary
+        })
+    else:
+        print("\n⚠️ 샘플 내에 자카드 유사도가 높은 쌍이 부족합니다. 임계값을 낮추거나 샘플을 늘려주세요.")
+        
+    print("="*70 + "\n")
+    return optimal_boundary if len(fn_sims) > 0 else None
+
+import json
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+import torch.nn.functional as F
+
+# 💡 9가지 전체 필드 정의
+ALL_FIELDS = ["CAT", "MAT", "FIT", "DET", "FNC", "CTX", "COL", "SPC", "LOC"]
+
+def load_and_parse_json(json_path):
+    print(f"📥 Loading JSON from {json_path}...")
+    with open(json_path, 'r', encoding='utf-8') as f:
+        raw_metadata = json.load(f)
+        
+    item_dict = {}
+    for meta in raw_metadata:
+        iid = str(meta.get('article_id', meta.get('item_id', '')))
+        if not iid: continue
+        
+        rf = meta.get("reinforced_feature", {})
+        
+        # 9개 필드를 동적으로 파싱
+        item_dict[iid] = {
+            field: [str(val).lower().strip() for val in rf.get(field, [])]
+            for field in ALL_FIELDS
+        }
+    print(f"✅ Loaded {len(item_dict)} items.")
+    return item_dict
+
+def extract_unique_attributes(item_dict):
+    unique_attrs = {field: set() for field in ALL_FIELDS}
+    
+    for attrs in item_dict.values():
+        for field in ALL_FIELDS:
+            unique_attrs[field].update(attrs[field])
+            
+    # 빈 문자열 제거 및 통계 출력
+    print("📊 Unique Attribute Counts:")
+    for field in ALL_FIELDS:
+        unique_attrs[field].discard("")
+        print(f"  - {field}: {len(unique_attrs[field])} unique words")
+        
+    return {k: list(v) for k, v in unique_attrs.items()}
+
+def build_aspect_item_embeddings(item_dict, sbert_model_name='all-MiniLM-L6-v2', device='cuda', weights=None):
+    if weights is None:
+        # 💡 패션 도메인 최적화 가중치 (총합 1.0)
+        # 색상(COL) 비중을 낮춰서 색상만 다른 동일 상품을 FN으로 묶어냄
+        weights = {
+            "CAT": 0.40, 
+            "MAT": 0.20, 
+            "FIT": 0.15, 
+            "DET": 0.10, 
+            "FNC": 0.05, 
+            "CTX": 0.05, 
+            "COL": 0.03, 
+            "SPC": 0.01, 
+            "LOC": 0.01
+        }
+        
+    print(f"\n🧠 Loading Sentence-BERT model: {sbert_model_name}...")
+    model = SentenceTransformer(sbert_model_name, device=device)
+    
+    unique_attrs_list = extract_unique_attributes(item_dict)
+    
+    # 1. 고유 단어들만 S-BERT로 임베딩 (캐싱)
+    print("\n⚡ Embedding unique attributes (Super Fast!)...")
+    attr_embeddings = {field: {} for field in ALL_FIELDS}
+    
+    for field in ALL_FIELDS:
+        words = unique_attrs_list[field]
+        if not words: continue
+        # S-BERT 인코딩
+        embs = model.encode(words, convert_to_tensor=True, show_progress_bar=False)
+        for w, emb in zip(words, embs):
+            attr_embeddings[field][w] = emb
+            
+    zero_vec = torch.zeros(384, device=device)
+    
+    # 2. 아이템별 최종 벡터 조립 (가중합)
+    print("🧩 Assembling final item vectors based on 9 weighted aspects...")
+    item_ids = list(item_dict.keys())
+    final_embs = []
+    
+    for iid in tqdm(item_ids):
+        attrs = item_dict[iid]
+        v_final = torch.zeros(384, device=device)
+        
+        for field in ALL_FIELDS:
+            # 해당 아이템이 가진 특정 필드의 단어 벡터들 수집
+            field_vecs = [attr_embeddings[field][w] for w in attrs[field] if w in attr_embeddings[field]]
+            
+            # 단어 벡터들의 평균을 구함 (해당 필드의 값이 없다면 zero_vec)
+            v_field = torch.stack(field_vecs).mean(dim=0) if field_vecs else zero_vec
+            
+            # 가중치를 곱해서 최종 벡터에 누적
+            v_final += weights[field] * v_field
+            
+        final_embs.append(v_final)
+        
+    final_embs_tensor = torch.stack(final_embs)
+    # L2 정규화
+    final_embs_tensor = F.normalize(final_embs_tensor, p=2, dim=1)
+    
+    return item_ids, final_embs_tensor
+def analyze_semantic_similarities(item_ids, embs_tensor, sample_size=5000):
+    print(f"\n📏 Calculating cosine similarities for a sample of {sample_size} items...")
+    # 6만 개를 통째로 $N^2$ 행렬곱 하면 RAM이 터질 수 있으므로 샘플링
+    total_items = embs_tensor.size(0)
+    sample_indices = np.random.choice(total_items, min(sample_size, total_items), replace=False)
+    
+    sample_embs = embs_tensor[sample_indices]
+    # [Sample, Sample] 크기의 코사인 유사도 행렬
+    sim_matrix = torch.matmul(sample_embs, sample_embs.T).cpu().numpy()
+    
+    # 대각선(자기 자신, 유사도 1.0)과 중복 계산 제외 (Upper triangle)
+    upper_tri_indices = np.triu_indices_from(sim_matrix, k=1)
+    sim_values = sim_matrix[upper_tri_indices]
+    
+    # 임계치(Threshold)별 쌍(Pairs) 개수 측정
+    thresholds = [0.85, 0.90, 0.95]
+    print("\n📊 [Semantic Similarity Distribution]")
+    for t in thresholds:
+        count = np.sum(sim_values >= t)
+        print(f"  - 유사도 {t:.2f} 이상인 쌍 개수: {count:,} 개")
+        
+    # 히스토그램 시각화 저장
+    plt.figure(figsize=(10, 6))
+    plt.hist(sim_values, bins=50, color='skyblue', edgecolor='black')
+    plt.axvline(0.85, color='red', linestyle='dashed', linewidth=2, label='0.85 (False Negative Zone)')
+    plt.title("S-BERT Semantic Similarity Distribution of Items")
+    plt.xlabel("Cosine Similarity")
+    plt.ylabel("Frequency")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig("sbert_similarity_distribution.png", dpi=300)
+    print("📈 Histogram saved as 'sbert_similarity_distribution.png'")
+    
+    # 상위 0.1% 유사도를 기준으로 False Negative Boundary 추천
+    recommended_boundary = np.percentile(sim_values, 99.9)
+    print(f"\n💡 [Conclusion] S-BERT 기반 상위 0.1% 유사도 점수는 {recommended_boundary:.4f} 입니다.")
+    print("이 이상의 점수를 가진 아이템 쌍을 HNM에서 강제로 배제(Masking)하는 기준값으로 활용하세요.")
+
+import os
+import json
+import torch
+import numpy as np
+import torch.nn.functional as F
+from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
+
+def get_or_build_aligned_sbert_embeddings(processor, base_dir, device='cuda'):
+    """
+    JSON을 읽어 9가지 속성 기반 S-BERT 임베딩을 생성하고, 
+    processor.item_ids의 순서(1-based)에 맞춰 정렬된 텐서(N+1, 384)를 반환합니다.
+    최초 1회 실행 시 .pt 파일로 저장하여 이후에는 빠르게 로드합니다.
+    """
+    cache_path = os.path.join(base_dir, "aligned_sbert_embs.pt")
+    
+    # 💡 1. 캐시 파일이 있으면 즉시 로드 (학습 속도 저하 방지)
+    if os.path.exists(cache_path):
+        print(f"♻️ [Phase 3-SBERT] Loading cached aligned S-BERT embeddings from {cache_path}...")
+        return torch.load(cache_path, map_location=device)
+        
+    print("\n🧠 [Phase 3-SBERT] Building Aligned S-BERT Semantic Vectors (First Time Only)...")
+    json_path = os.path.join(base_dir, "filtered_data_reinforced.json")
+    
+    # 1. JSON 로드 및 매핑 딕셔너리 생성
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            raw_metadata = json.load(f)
+    except Exception as e:
+        raise RuntimeError(f"❌ Failed to load JSON: {e}")
+        
+    ALL_FIELDS = ["CAT", "MAT", "FIT", "DET", "FNC", "CTX", "COL", "SPC", "LOC"]
+    metadata_dict = {}
+    for meta in raw_metadata:
+        iid = str(meta.get('article_id', meta.get('item_id', '')))
+        if iid:
+            rf = meta.get("reinforced_feature", {})
+            metadata_dict[iid] = {f: [str(v).lower().strip() for v in rf.get(f, [])] for f in ALL_FIELDS}
+            
+    # 2. 고유 속성 추출 및 단 1번씩만 인코딩 (초고속화)
+    unique_attrs = {f: set() for f in ALL_FIELDS}
+    for attrs in metadata_dict.values():
+        for f in ALL_FIELDS:
+            unique_attrs[f].update(attrs[f])
+            
+    for f in ALL_FIELDS: unique_attrs[f].discard("")
+
+    print("⚡ Encoding unique attributes with S-BERT...")
+    model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+    attr_embs = {f: {} for f in ALL_FIELDS}
+    
+    for field in ALL_FIELDS:
+        words = list(unique_attrs[field])
+        if not words: continue
+        embs = model.encode(words, convert_to_tensor=True, show_progress_bar=False)
+        for w, emb in zip(words, embs):
+            attr_embs[field][w] = emb
+            
+    # 3. processor.item_ids 순서에 맞춰 (N+1, 384) 텐서 조립
+    num_items = processor.num_items + 1
+    # S-BERT all-MiniLM-L6-v2의 차원은 384
+    aligned_sbert_arr = torch.zeros((num_items, 384), device=device)
+    
+    weights = {"CAT": 0.40, "MAT": 0.20, "FIT": 0.15, "DET": 0.10, 
+               "FNC": 0.05, "CTX": 0.05, "COL": 0.03, "SPC": 0.01, "LOC": 0.01}
+    zero_vec = torch.zeros(384, device=device)
+    
+    matched = 0
+    print(f"🧩 Aligning to processor items (1 to {processor.num_items})...")
+    for i, current_id_str in enumerate(tqdm(processor.item_ids)):
+        idx = i + 1 # 1-based index (0은 zero vector로 유지)
+        
+        if current_id_str in metadata_dict:
+            attrs = metadata_dict[current_id_str]
+            v_final = torch.zeros(384, device=device)
+            
+            for field in ALL_FIELDS:
+                vecs = [attr_embs[field][w] for w in attrs[field] if w in attr_embs[field]]
+                v_field = torch.stack(vecs).mean(dim=0) if vecs else zero_vec
+                v_final += weights[field] * v_field
+                
+            aligned_sbert_arr[idx] = v_final
+            matched += 1
+            
+    # L2 정규화 (코사인 유사도 연산용)
+    aligned_sbert_arr = F.normalize(aligned_sbert_arr, p=2, dim=1)
+    
+    print(f"✅ S-BERT Vectors Aligned: {matched}/{len(processor.item_ids)}")
+    
+    # 메모리 해제 및 캐싱
+    del model, attr_embs, raw_metadata, metadata_dict
+    torch.cuda.empty_cache()
+    
+    torch.save(aligned_sbert_arr, cache_path)
+    print(f"💾 Saved aligned S-BERT embeddings to {cache_path}")
+    
+    return aligned_sbert_arr
+
+def analysis_model_and_vectors():
+    SEQ_LABELS = ['item_id', 'recency_curr', 'week_curr', 'item_type', 'target_week']
+    STATIC_LABELS = [
+        'age', 'price',
+        'channel', 'club', 'news', 'fn', 'active',
+        'cont_price_std', 'cont_last_diff', 'cont_repurch', 'cont_weekend'
+    ] 
+    
+    # 1. Config & Env
+    cfg = PipelineConfig()
+    device = setup_environment()
+    processor , val_processor, cfg = prepare_features(cfg)
+    
+   
+    
+    # -----------------------------------------------------------
+    # 💡 하드 네거티브 및 하이퍼파라미터 세팅
+    # -----------------------------------------------------------
+    cfg.lr = 1e-3               
+    cfg.epochs = 30       
+    cfg.HN_K = 150 
+    cfg.EX_TOP_K = 10
+    cfg.soft_penalty_weigh = 1
+    cfg.batch_size = 512
+    cfg.hn_scheduled = False
+    cfg.dropout = 0.25
+    cfg.boubdary_ratio = 0.90
+    HASH_SIZE = 1000
+    cfg.num_prod_types = HASH_SIZE
+    cfg.num_colors = HASH_SIZE
+    cfg.num_graphics = HASH_SIZE
+    cfg.num_sections = HASH_SIZE
+    TARGET_VAL_PATH = os.path.join(cfg.base_dir, "features_target_val.parquet")
+
+    # 2. Data & Metadata 가져오기
+    aligned_vecs = load_aligned_pretrained_embeddings(processor, cfg.model_dir, cfg.pretrained_dim)
+    log_q_tensor = processor.get_logq_probs(device)
+    
+    item_metadata_tensor = load_item_metadata_hashed(processor, cfg.base_dir, hash_size=HASH_SIZE)
+    processor.i_side_arr = item_metadata_tensor.numpy()
+    val_processor.i_side_arr = processor.i_side_arr
+    
+    train_loader = create_dataloaders(processor, cfg, "2020-09-16", aligned_vecs, is_train=True)
+    val_loader = create_dataloaders(val_processor, cfg, "2020-09-22", aligned_vecs, is_train=False)
+    
+    #json_path = os.path.join(cfg.base_dir, "filtered_data_reinforced.json")
+    #item_category_ids = create_category_mapping_tensor(json_path, processor, device)
+    
+    wandb.init(
+        project="SASRec-User-Tower-causality-Optimization-v2",
+        name=f"analysis_model_SessionWeight_lr{cfg.lr}_K{cfg.HN_K}", 
+        config=cfg.__dict__ 
+    )
+    
+    # -----------------------------------------------------------
+    # 3. Models Setup & 💡 Epoch 11 베이스라인 가중치 로드
+    # -----------------------------------------------------------
+    user_tower, item_tower = setup_models(cfg, device, None, log_q_tensor) 
+    
+    # 💡 [요청 사항 1] 모델 경로 지정 및 로드
+    base_user_pth = os.path.join(cfg.model_dir, "best_user_tower_from_scratch_base_feature.pth")
+    base_item_pth = os.path.join(cfg.model_dir, "best_item_tower_from_scratch_base_feature.pth")
+    
+    save_user_pth = os.path.join(cfg.model_dir, "best_user_tower_0312_session_v4_hm.pth")
+    save_item_pth = os.path.join(cfg.model_dir, "best_item_tower_0312_session_v4_hm.pth")
+
+    item_tower.init_from_pretrained(aligned_vecs.to(device))
+    
+    print(f"📥 Loading Baseline Models from Epoch 11...")
+    user_tower.load_state_dict(torch.load(base_user_pth, map_location=device))
+    item_tower.load_state_dict(torch.load(base_item_pth, map_location=device))
+    print(f"✅ Baseline Models loaded successfully.")
+    
+    
+    # =====================================================================
+    # 💡 [신규 삽입] Phase 1~3: 훈련 전 임베딩 지형 및 메타데이터 기반 HNM 경계 분석
+    # =====================================================================
+    print("\n" + "="*70)
+    print("🔬 [Pre-Training Analysis] Running Topology & Boundary Diagnostics")
+    print("="*70)
+    
+    item_tower.eval()
+    user_tower.eval()
+    
+    with torch.no_grad():
+        # 1. 전체 아이템 임베딩 추출
+        all_item_embs = item_tower.get_all_embeddings()
+        
+        # 2. 메타데이터 JSON 로드 및 딕셔너리 변환 (경로는 환경에 맞게 수정)
+        import json
+        metadata_json_path = os.path.join(cfg.base_dir, "filtered_data_reinforced.json")
+        with open(metadata_json_path, 'r', encoding='utf-8') as f:
+            raw_metadata = json.load(f)
+            
+        # 함수 요구사항에 맞게 딕셔너리 매핑
+        # (주의: raw_metadata의 키가 string 형태의 item_id라고 가정, processor.item2id로 변환)
+        item_metadata_dict = {}
+        item_id_to_category = {}
+        
+        # 💡 [수정됨] raw_metadata가 리스트(List) 형태이므로 바로 순회합니다.
+        for meta in raw_metadata:
+            # ⚠️ 주의: JSON 내에서 아이템 ID를 나타내는 키를 확인해서 맞춰주세요!
+            # (보통 H&M 데이터는 'article_id'를 많이 쓰며, 일반적으론 'item_id'를 씁니다)
+            str_iid = str(meta.get('article_id', meta.get('item_id', ''))) 
+            
+            if not str_iid:
+                continue # ID가 없는 잘못된 데이터는 스킵
+                
+            if str_iid in processor.item2id:
+                encoded_iid = processor.item2id[str_iid]
+                
+                # Phase 3 용 (MAT, CAT, DET)
+                item_metadata_dict[encoded_iid] = meta.get("reinforced_feature", {})
+                
+                # Phase 1, 2 용 (단일 카테고리 추출)
+                cat_list = meta.get("reinforced_feature", {}).get("CAT", ["Unknown"])
+                item_id_to_category[encoded_iid] = cat_list[0] if cat_list else "Unknown"
+        # -----------------------------------------------------------------
+        # [실행 A] Phase 3: 메타데이터 자카드 유사도 기반 최적 Boundary 추출
+        # -----------------------------------------------------------------
+        optimal_boundary = find_optimal_hnm_boundary_via_metadata(
+            item_embs=all_item_embs,
+            item_metadata_dict=item_metadata_dict,
+            device=device,
+            jaccard_threshold=0.75 # 75% 이상 속성이 같으면 FN으로 간주
+        )
+        
+        # 💡 [핵심] 통계적으로 도출된 경계값을 파이프라인 cfg에 동적 덮어쓰기!
+        if optimal_boundary is not None:
+            # 보수적으로 살짝 낮춰서(예: 0.02) 여유를 줍니다.
+            applied_boundary = max(0.80, optimal_boundary - 0.02) 
+            print(f"🔄 Updating cfg.boundary_ratio: {cfg.boubdary_ratio} -> {applied_boundary:.4f}")
+            cfg.boubdary_ratio = applied_boundary # 훈련 루프에서 이 값을 사용하게 됨
+            wandb.config.update({"dynamic_boundary_ratio": applied_boundary}, allow_val_change=True)
+
+        # -----------------------------------------------------------------
+        # [실행 B] Phase 1 & 2: R@100 Hit & R@10 Miss 오답 노트 분석
+        # -----------------------------------------------------------------
+        # 분석을 위해 검증 데이터셋에서 샘플 유저 벡터 추출 (시간 절약을 위해 10 배치만 추출)
+        print("⏳ Extracting sample user embeddings for error analysis...")
+        sample_user_embs = []
+        sample_user_ids = []
+        
+        for b_idx, batch in enumerate(val_loader):
+            if b_idx >= 10: break # 샘플링 10배치
+            u_ids = batch['user_ids']
+            padding_mask = batch['padding_mask'].to(device)
+            
+            forward_kwargs_eval = {
+                'pretrained_vecs': val_loader.dataset.pretrained_lookup[batch['item_ids'].cpu()].to(device),
+                'item_ids': batch['item_ids'].to(device),
+                'time_bucket_ids': batch['time_bucket_ids'].to(device),
+                'type_ids': batch['type_ids'].to(device), 'color_ids': batch['color_ids'].to(device),
+                'graphic_ids': batch['graphic_ids'].to(device), 'section_ids': batch['section_ids'].to(device),
+                'age_bucket': batch['age_bucket'].to(device), 'price_bucket': batch['price_bucket'].to(device),
+                'cnt_bucket': batch['cnt_bucket'].to(device), 'recency_bucket': batch['recency_bucket'].to(device),
+                'channel_ids': batch['channel_ids'].to(device), 'club_status_ids': batch['club_status_ids'].to(device),
+                'news_freq_ids': batch['news_freq_ids'].to(device), 'fn_ids': batch['fn_ids'].to(device),
+                'active_ids': batch['active_ids'].to(device), 'cont_feats': batch['cont_feats'].to(device),
+                'recency_offset': batch['recency_offset'].to(device), 'current_week': batch['current_week'].to(device), 
+                'target_week': batch['target_week'].to(device), 'session_ids': batch['session_ids'].to(device),
+                'padding_mask': padding_mask,
+                'training_mode': False
+            }
+            
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+                out = user_tower(**forward_kwargs_eval)
+            
+            # 💡 [핵심 수정] evaluate_model과 동일한 안전한 차원 추출 로직
+            if out.dim() == 3:
+                lengths = (~padding_mask).sum(dim=1)
+                last_idx = (lengths - 1).clamp(min=0)
+                batch_range = torch.arange(out.size(0), device=device)
+                u_emb = out[batch_range, last_idx]
+            else:
+                u_emb = out
+                
+            # 혹시라도 1D로 풀리는 것을 방지
+            if u_emb.dim() == 1:
+                u_emb = u_emb.unsqueeze(0)
+                
+            sample_user_embs.append(u_emb)
+            sample_user_ids.extend(u_ids)
+
+        # 이제 안전하게 [Total_Samples, Dim] 형태의 2D 텐서로 결합됩니다.
+        sample_user_embs = torch.cat(sample_user_embs, dim=0)
+        
+        target_df = pd.read_parquet(TARGET_VAL_PATH)
+        target_dict = target_df.set_index('customer_id')['target_ids'].to_dict()
+        del target_df
+
+        run_diagnostic_analysis(
+            user_embs=sample_user_embs,
+            item_embs=all_item_embs,
+            target_dict=target_dict,
+            user_ids=sample_user_ids,
+            item_id_to_category=item_id_to_category,
+            device=device
+        )
+        
+        del sample_user_embs, all_item_embs
+        torch.cuda.empty_cache()
+
+    # =====================================================================
+    # (종료) 다시 정상 학습 파이프라인으로 복귀
+    # =====================================================================
 
 def resume_pipeline_session_weights():
     """
@@ -2717,14 +3689,15 @@ def resume_pipeline_session_weights():
     # -----------------------------------------------------------
     # 💡 하드 네거티브 및 하이퍼파라미터 세팅
     # -----------------------------------------------------------
-    cfg.lr = 3e-4               # 기존 학습률 유지
-    cfg.epochs = 20        # 이미 11에포크를 돌았으므로, 추가로 30에포크면 충분
-    cfg.HN_K = 150  # 20개 추출 후 내부 0.95 제약으로 필터링
-    cfg.EX_TOP_K = 0
+    cfg.lr = 2e-4               
+    cfg.epochs = 60      
+    cfg.HN_K = 150 
+    cfg.EX_TOP_K = 3
     cfg.soft_penalty_weigh = 1
     cfg.batch_size = 512
     cfg.hn_scheduled = False
-    cfg.dropout = 0.3
+    cfg.dropout = 0.25
+    cfg.boubdary_ratio = 0.90
     HASH_SIZE = 1000
     cfg.num_prod_types = HASH_SIZE
     cfg.num_colors = HASH_SIZE
@@ -2739,6 +3712,8 @@ def resume_pipeline_session_weights():
     item_metadata_tensor = load_item_metadata_hashed(processor, cfg.base_dir, hash_size=HASH_SIZE)
     processor.i_side_arr = item_metadata_tensor.numpy()
     val_processor.i_side_arr = processor.i_side_arr
+    
+    aligned_sbert_embs =get_or_build_aligned_sbert_embeddings(processor, cfg.base_dir, device)
     
     train_loader = create_dataloaders(processor, cfg, "2020-09-16", aligned_vecs, is_train=True)
     val_loader = create_dataloaders(val_processor, cfg, "2020-09-22", aligned_vecs, is_train=False)
@@ -2758,11 +3733,11 @@ def resume_pipeline_session_weights():
     user_tower, item_tower = setup_models(cfg, device, None, log_q_tensor) 
     
     # 💡 [요청 사항 1] 모델 경로 지정 및 로드
-    base_user_pth = os.path.join(cfg.model_dir, "best_user_tower_0311_session_v2.pth")
-    base_item_pth = os.path.join(cfg.model_dir, "best_item_tower_0311_session_v2.pth")
+    base_user_pth = os.path.join(cfg.model_dir, "best_user_tower_0312_session_v4_hm.pth")
+    base_item_pth = os.path.join(cfg.model_dir, "best_item_tower_0312_session_v4_hm.pth")
     
-    save_user_pth = os.path.join(cfg.model_dir, "best_user_tower_0311_session_v2_hm2.pth")
-    save_item_pth = os.path.join(cfg.model_dir, "best_item_tower_0311_session_v2_hm2.pth")
+    save_user_pth = os.path.join(cfg.model_dir, "best_user_tower_0312_session_v4_hm_r1.pth")
+    save_item_pth = os.path.join(cfg.model_dir, "best_item_tower_0312_session_v4_hm_r1.pth")
 
     item_tower.init_from_pretrained(aligned_vecs.to(device))
     
@@ -2812,11 +3787,11 @@ def resume_pipeline_session_weights():
     # -----------------------------------------------------------
     # 4. Training Loop (💡 자연스러운 출력을 위해 에포크 10부터 시작)
     # -----------------------------------------------------------
-    start_epoch = 10
+    start_epoch = 30
     end_epoch = start_epoch + cfg.epochs
     #prev_ex_top_k = cfg.EX_TOP_K 
     
-    current_beta = 0.15  
+    current_beta = 0.20
     for epoch in range(start_epoch, end_epoch):
         
         
@@ -2827,16 +3802,27 @@ def resume_pipeline_session_weights():
             norm_item_embeddings = F.normalize(all_item_embs, p=2, dim=1) # [50000, Dim]
             
             # 10에포크부터는 이 캐시된 임베딩을 마이닝에도 재사용하여 속도 극대화
-            if epoch >= 50:
+            if epoch >= 14:
                 if (epoch - 10) % 1 == 0 or force_mining_next_epoch:
                     print(f"🔍 Mining Global Hard Negatives using cached embeddings...")
-                    epoch_hn_pool = mine_global_hard_negatives(
-                        norm_item_embeddings, # 다시 계산 안 하고 캐시본 사용
-                        exclusion_top_k=2, 
-                        mine_k=150, 
+                    epoch_hn_pool, hn_metrics = mine_global_hard_negatives(
+                        item_embs=norm_item_embeddings,    # 다시 계산 안 하고 캐시본 사용
+                        sbert_embs=aligned_sbert_embs,     # 💡 [수정 사항 2] 시맨틱 방어막 텐서 주입
+                        fn_threshold=0.85,
+                        fn_lower=0.50, # 💡 [수정 사항 3] 시맨틱 유사도 0.85 이상은 오답 풀에서 영구 배제
+                        exclusion_top_k=cfg.EX_TOP_K,      # (안전지대)
+                        mine_k=200, 
                         batch_size=2048, 
                         device=device
                     )
+                    wandb.log(hn_metrics)
+                    #epoch_hn_pool = mine_global_hard_negatives(
+                    #    norm_item_embeddings, # 다시 계산 안 하고 캐시본 사용
+                    #    exclusion_top_k=cfg.EX_TOP_K, 
+                    #    mine_k=200, 
+                    #    batch_size=2048, 
+                    #    device=device
+                    #)
                     force_mining_next_epoch = False
                     #if (hn_scheduler.ex_top_k if hn_scheduler else cfg.EX_TOP_K)<= 80:
                     #    if prev_ex_top_k < (hn_scheduler.ex_top_k if hn_scheduler else cfg.EX_TOP_K):
@@ -2863,7 +3849,7 @@ def resume_pipeline_session_weights():
         print(f"Epoch [{epoch}/{cfg.epochs}]  - Current LR: {current_lr:.8f}")
         
         
-        T_sample = max(0.25, 0.5 - (epoch - (start_epoch)) * 0.025)
+        T_sample = max(0.2, 0.50 - (int((epoch - start_epoch)/2)) * 0.015)
         # ------------------- 훈련 (Train) -------------------
         avg_loss, force_mining_next_epoch, avg_discard_ratio = train_user_tower_session_sampler_with_intent_point(
             epoch=epoch,
@@ -2883,8 +3869,8 @@ def resume_pipeline_session_weights():
             T_sample =  T_sample,
             beta= current_beta,
             hn_refresh_interval=0,      # N배치마다 pool 재갱신
-            hn_exclusion_top_k=2,         # mining 파라미터 직접 전달
-            hn_mine_k=150,
+            hn_exclusion_top_k=5,         # mining 파라미터 직접 전달
+            hn_mine_k=200,
             seq_labels=SEQ_LABELS,
             static_labels=STATIC_LABELS,
         )
@@ -2894,12 +3880,12 @@ def resume_pipeline_session_weights():
         #prev_ex_top_k = hn_scheduler.ex_top_k if hn_scheduler else cfg.EX_TOP_K
         
         # Beta curriculum
-        if avg_discard_ratio < 0.25:
-            current_beta = 0.15
-        elif avg_discard_ratio < 0.40:
-            current_beta = 0.20
-        else:
-            current_beta = 0.25
+        #if avg_discard_ratio < 0.25:
+        #    current_beta = 0.15
+        #elif avg_discard_ratio < 0.40:
+        #    current_beta = 0.20
+        #else:
+        #    current_beta = 0.25
 
         print(f"📊 [Epoch {epoch}] avg_discard_ratio={avg_discard_ratio:.3f} "
               f"→ next beta={current_beta:.2f}, T_sample={T_sample:.3f}")
@@ -3071,7 +4057,7 @@ def train_pipeline_from_scratch():
                     epoch_hn_pool = mine_global_hard_negatives(
                         norm_item_embeddings, # 다시 계산 안 하고 캐시본 사용
                         exclusion_top_k=5 ,
-                        mine_k=150, 
+                        mine_k=200, 
                         batch_size=2048, 
                         device=device
                     )
@@ -3179,7 +4165,15 @@ if __name__ == "__main__":
     import torch.multiprocessing as mp
     #mp.freeze_support()
     mp.set_start_method('spawn', force=True)  # Windows 필수
+    #analysis_model_and_vectors()
+    #cfg = PipelineConfig()
+    #JSON_PATH = os.path.join(cfg.base_dir, "filtered_data_reinforced.json")
+    #item_dict = load_and_parse_json(JSON_PATH)
     
-    #resume_pipeline_session_weights()
+    # 함수 호출 시 기본 세팅된 9가지 가중치가 자동 적용됩니다.
+    #ids, embs = build_aspect_item_embeddings(item_dict)
+    
+    #analyze_semantic_similarities(ids, embs, sample_size=5000)
+    resume_pipeline_session_weights()
     #run_resume_pipeline_v2()
-    train_pipeline_from_scratch()
+    #train_pipeline_from_scratch()

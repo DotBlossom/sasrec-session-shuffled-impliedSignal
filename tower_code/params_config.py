@@ -13,7 +13,7 @@ class PipelineConfig:
     # Hyperparameters
     batch_size: int = 512
     lr: float = 5e-4
-    weight_decay: float = 1e-4
+    weight_decay: float = 5e-2
     epochs: int = 15
     
     # Model Args (SASRecUserTower용)
@@ -51,3 +51,6 @@ class PipelineConfig:
     EX_TOP_K = 25
     soft_penalty_weigh = 3
     hn_scheduled = False
+    
+    boubdary_ratio = 0.85
+    lambda_align = 0.05

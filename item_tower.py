@@ -1,3 +1,4 @@
+from fastapi import Depends
 from sqlalchemy import select
 import torch
 import torch.nn as nn
@@ -11,7 +12,7 @@ import copy
 import random
 from tqdm import tqdm
 from torch.amp import autocast, GradScaler
-from database import ProductInferenceInput, TrainingItem
+from database import ProductInferenceInput, SessionLocal, TrainingItem, get_db
 from utils import vocab
 
 import os
@@ -1125,3 +1126,331 @@ def train_simcse_from_db(
         # =========================================================
 
     print("Training Finished.")
+
+
+
+import torch
+import torch.nn.functional as F
+import copy
+from typing import List, Dict, Tuple
+from collections import defaultdict
+import numpy as np
+
+class EmbeddingEvaluator:
+    def __init__(self, model: nn.Module, collator, device: str):
+        self.model = model.to(device)
+        self.model.eval()  # 평가 모드 (Dropout 등 비활성화)
+        self.collator = collator
+        self.device = device
+        
+        # 모델은 Wrapper가 아닌 학습된 Encoder 자체를 바로 사용한다고 가정
+        # 만약 Wrapper 구조라면 self.model = model.encoder 로 세팅 추천
+        
+    @torch.no_grad()
+    def get_embeddings(self, items: List[TrainingItem], batch_size: int = 256) -> torch.Tensor:
+        """아이템 리스트를 받아 전체 임베딩 텐서(N, D)를 반환합니다."""
+        all_embeddings = []
+        
+        for i in range(0, len(items), batch_size):
+            batch_items = items[i : i + batch_size]
+            # collator를 통해 텐서화
+            std, re_ids, re_mask, txt_ids, txt_mask = self.collator.process_batch_items(batch_items)
+            
+            std = std.to(self.device)
+            re_ids = re_ids.to(self.device)
+            re_mask = re_mask.to(self.device)
+            txt_ids = txt_ids.to(self.device)
+            txt_mask = txt_mask.to(self.device)
+            
+            # Encoder 통과 후 L2 정규화
+            emb = self.model(std, re_ids, re_mask, txt_ids, txt_mask)
+            emb = F.normalize(emb, p=2, dim=1)
+            all_embeddings.append(emb.cpu())
+            
+        return torch.cat(all_embeddings, dim=0)
+
+    def generate_case_data(self, original_items: List[TrainingItem], mode: str, drop_key: str = None) -> List[TrainingItem]:
+        """목적에 맞게 데이터를 변형하여 Case를 생성합니다."""
+        modified_items = []
+        for item in original_items:
+            new_feats = copy.deepcopy(item.feature_data)
+            new_name = item.product_name
+            
+            if mode == "case1":
+                # [Case 1] 카테고리 등 기본 필드(STD)만 남기고 메타데이터(RE, Text) 전부 삭제
+                for k in list(new_feats.keys()):
+                    if k in vocab.RE_FEATURE_KEYS:
+                        del new_feats[k]
+                new_name = ""
+                
+            elif mode == "case2":
+                # [Case 2] 원본 데이터 그대로 사용
+                pass 
+                
+            elif mode == "ablation":
+                # [Ablation] Case 2에서 특정 필드(drop_key)만 마스킹
+                if drop_key in new_feats:
+                    del new_feats[drop_key]
+                    
+            #modified_items.append(TrainingItem(item.product_id, new_feats, new_name))
+            modified_items.append(TrainingItem(
+                product_id=item.product_id, 
+                feature_data=new_feats, 
+                product_name=new_name
+            ))
+        return modified_items
+
+    # ==========================================
+    # 가설 1. 앵커 정렬도 (Anchor Alignment)
+    # ==========================================
+    def test_anchor_alignment(self, v1_emb: torch.Tensor, v2_emb: torch.Tensor):
+        print("\n" + "="*50)
+        print("🎯 [Hypothesis 1] Anchor Alignment (Case 1 vs Case 2)")
+        print("="*50)
+        
+        # 동일 아이템 간의 코사인 유사도 평균 계산
+        cosine_sims = F.cosine_similarity(v1_emb, v2_emb, dim=1)
+        mean_sim = cosine_sims.mean().item()
+        
+        print(f"👉 V1 & V2 Mean Cosine Similarity: {mean_sim:.4f}")
+        if mean_sim > 0.8:
+            print("✅ 증명 완료: Case 2가 추가 정보로 확장되었으나, Case 1의 기존 앵커(우주)를 안정적으로 유지하고 있습니다.")
+        else:
+            print("⚠️ 경고: 거리가 너무 멉니다. 텍스트 정보가 기존 뼈대를 과도하게 왜곡시키고 있을 수 있습니다.")
+
+    # ==========================================
+    # 가설 2. 군집 내 분산 vs 군집 간 분산
+    # ==========================================
+    def test_cluster_variance(self, items: List[TrainingItem], v1_emb: torch.Tensor, v2_emb: torch.Tensor, cluster_key: str = "product_type_name"):
+        print("\n" + "="*50)
+        print(f"🎯 [Hypothesis 2] Intra/Inter Cluster Variance (기준: {cluster_key})")
+        print("="*50)
+        
+        # 카테고리별 인덱스 수집
+        cluster_indices = defaultdict(list)
+        for idx, item in enumerate(items):
+            cat = item.feature_data.get(cluster_key)
+            if cat:
+                cluster_indices[cat].append(idx)
+                
+        # 10개 이상의 아이템이 있는 의미 있는 군집만 필터링
+        valid_clusters = {k: v for k, v in cluster_indices.items() if len(v) >= 10}
+        print(f"분석 대상 군집 수: {len(valid_clusters)}개")
+        
+        def calc_cluster_stats(embeddings):
+            intra_variances = []
+            centroids = []
+            
+            for cat, indices in valid_clusters.items():
+                cluster_vecs = embeddings[indices] # (N_c, D)
+                centroid = cluster_vecs.mean(dim=0, keepdim=True) # (1, D)
+                
+                # 군집 내 분산 (중심점과의 평균 거리)
+                var = F.pairwise_distance(cluster_vecs, centroid).pow(2).mean().item()
+                intra_variances.append(var)
+                centroids.append(centroid)
+                
+            centroids = torch.cat(centroids, dim=0) # (K, D)
+            # 군집 간 분산 (중심점들 사이의 평균 거리)
+            inter_dist = torch.pdist(centroids, p=2).pow(2).mean().item()
+            
+            return np.mean(intra_variances), inter_dist
+
+        v1_intra, v1_inter = calc_cluster_stats(v1_emb)
+        v2_intra, v2_inter = calc_cluster_stats(v2_emb)
+        
+        print(f"🔹 [Case 1] 군집 내 분산: {v1_intra:.4f} | 군집 간 거리: {v1_inter:.4f}")
+        print(f"🔹 [Case 2] 군집 내 분산: {v2_intra:.4f} | 군집 간 거리: {v2_inter:.4f}")
+        
+        if v2_intra > v1_intra:
+            print("✅ 군집 내 분산 증가: 텍스트 추가로 인해 같은 카테고리 내에서도 미세한 디테일 공간이 형성되었습니다.")
+        if abs(v2_inter - v1_inter) / v1_inter < 0.2: 
+            print("✅ 군집 간 거리 유지: 카테고리 간의 거시적 분류 체계가 무너지지 않고 잘 보존되었습니다.")
+
+    # ==========================================
+    # 가설 3. 메타데이터 필드별 기여도 (Ablation)
+    # ==========================================
+    def test_ablation_variance(self, original_items: List[TrainingItem], case2_emb: torch.Tensor):
+        print("\n" + "="*50)
+        print("🎯 [Hypothesis 3] Field Ablation Variance Analysis")
+        print("="*50)
+        
+        # Case 2의 전체 분산 계산 (모든 벡터의 평균점으로부터의 분산)
+        global_centroid = case2_emb.mean(dim=0, keepdim=True)
+        base_variance = F.pairwise_distance(case2_emb, global_centroid).pow(2).mean().item()
+        print(f"🔹 [Base Case 2] 총 분산: {base_variance:.4f}")
+        print("-" * 30)
+        
+        # 각 필드를 하나씩 지워가며 분산 하락폭 측정
+        contributions = {}
+        for key in vocab.RE_FEATURE_KEYS:
+            ablated_items = self.generate_case_data(original_items, mode="ablation", drop_key=key)
+            ablated_emb = self.get_embeddings(ablated_items)
+            
+            ablated_centroid = ablated_emb.mean(dim=0, keepdim=True)
+            ablated_variance = F.pairwise_distance(ablated_emb, ablated_centroid).pow(2).mean().item()
+            
+            variance_drop = base_variance - ablated_variance
+            contributions[key] = variance_drop
+            print(f"   - W/O {key:<6} : 분산 {ablated_variance:.4f} (기여도: {variance_drop:+.4f})")
+            
+        # 가장 기여도가 높은 필드 찾기
+        best_field = max(contributions, key=contributions.get)
+        print("-" * 30)
+        print(f"✅ 결론: 뼈대 주변의 공간을 가장 입체적으로 부풀려준(정보 기여도가 높은) 필드는 '{best_field}' 입니다.")
+
+
+# ----------------------------------------------------------------------
+# 🚀 실행 스크립트 (Main Execution)
+# ----------------------------------------------------------------------
+def run_evaluation(encoder, dataloader, db_items, device):
+    print("Initializing Evaluator...")
+    evaluator = EmbeddingEvaluator(model=encoder, collator=SimCSECollator(), device=device)
+    
+    # 1. 테스트할 데이터 준비 (예: DB에서 불러온 처음 10000개 샘플링)
+    test_items = db_items[:10000] 
+    
+    # 2. Case 데이터 생성
+    case1_items = evaluator.generate_case_data(test_items, mode="case1")
+    case2_items = evaluator.generate_case_data(test_items, mode="case2")
+    
+    # 3. 임베딩 일괄 추출 (추론)
+    print("Extracting Case 1 Embeddings...")
+    v1_embeddings = evaluator.get_embeddings(case1_items)
+    
+    print("Extracting Case 2 Embeddings...")
+    v2_embeddings = evaluator.get_embeddings(case2_items)
+    
+    # 4. 가설 검증 실행
+    evaluator.test_anchor_alignment(v1_embeddings, v2_embeddings)
+    evaluator.test_cluster_variance(test_items, v1_embeddings, v2_embeddings, cluster_key="product_type_name")
+    evaluator.test_ablation_variance(test_items, v2_embeddings)
+
+# 실행 예시: 
+# run_evaluation(model.encoder, dataloader, products_list, DEVICE)
+def evaluate_trained_model(
+    encoder: nn.Module, 
+    db_session,          # DB 세션 객체
+    checkpoint_path: str # 저장된 Encoder 가중치 경로 (예: "encoder_ep10_loss0.05.pth")
+):
+    DEVICE = next(encoder.parameters()).device # 모델의 디바이스 확인
+    print(f"🚀 Starting Evaluation Pipeline on {DEVICE}...")
+
+    # ==========================================
+    # 1. DB에서 평가용 데이터 로드 (기존 학습 코드와 동일)
+    # ==========================================
+    stmt = select(
+        ProductInferenceInput.product_id, 
+        ProductInferenceInput.feature_data, 
+        ProductInferenceInput.product_name 
+    )
+    result = db_session.execute(stmt).mappings().all()
+
+    if not result:
+        print("❌ [Error] No data found in DB.")
+        return
+
+    products_list = []
+    for row in result:
+        raw_feats = dict(row['feature_data'])
+        
+        if 'reinforced_feature' in raw_feats:
+            re_dict = raw_feats['reinforced_feature']
+            if isinstance(re_dict, dict):
+                for key, val in re_dict.items():
+                    vocab_key = key if (key.startswith("[") and key.endswith("]")) else f"[{key}]"
+                    raw_feats[vocab_key] = val
+                    
+        base_name = row['product_name']
+        product_type = raw_feats.get('product_type_name', "").strip()
+        
+        item = TrainingItem(
+            product_id=str(row['product_id']), 
+            feature_data=raw_feats, 
+            product_name=base_name if base_name else ""
+        )
+        products_list.append(item)
+        
+    print(f"✅ Loaded {len(products_list)} items for evaluation.")
+
+    # ==========================================
+    # 2. 체크포인트(학습된 가중치) 로드
+    # ==========================================
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"♻️ Loading Checkpoint from: {checkpoint_path}")
+        state_dict = torch.load(checkpoint_path, map_location=DEVICE)
+        
+        try:
+            encoder.load_state_dict(state_dict)
+            print("✅ Encoder weights loaded successfully.")
+        except Exception as e:
+            print(f"⚠️ Warning: Strict load failed. Trying non-strict. Error: {e}")
+            encoder.load_state_dict(state_dict, strict=False)
+    else:
+        print(f"❌ [Error] Checkpoint not found at {checkpoint_path}. Exiting.")
+        return
+
+    encoder.eval() # 평가 모드 전환 (Dropout 비활성화)
+
+    # ==========================================
+    # 3. 평가 파이프라인 실행
+    # ==========================================
+    print("\n" + "="*50)
+    print("🧠 Initializing Embedding Evaluator...")
+    print("="*50)
+    
+    # 평가기 초기화 (Collator는 평가 시 토크나이징을 위해 필요함)
+    collator = SimCSECollator()
+    evaluator = EmbeddingEvaluator(model=encoder, collator=collator, device=DEVICE)
+    
+    # 전체 데이터가 너무 많으면 메모리 부족이 발생할 수 있으므로, 
+    # 대표성을 띄는 샘플 1만 개 정도만 추출해서 평가하는 것을 권장합니다.
+    test_items = products_list[:10000] 
+    print(f"🧪 Using {len(test_items)} items for variance/alignment testing.")
+    
+    # Case 데이터 생성 (앞서 만든 EmbeddingEvaluator 내부 함수)
+    print("📦 Generating Case 1 (Standard Only) Data...")
+    case1_items = evaluator.generate_case_data(test_items, mode="case1")
+    
+    print("📦 Generating Case 2 (Full Metadata) Data...")
+    case2_items = evaluator.generate_case_data(test_items, mode="case2")
+    
+    # 임베딩 추출
+    print("🧮 Extracting Case 1 Embeddings...")
+    v1_embeddings = evaluator.get_embeddings(case1_items, batch_size=128) # 메모리에 맞게 배치 조절
+    
+    print("🧮 Extracting Case 2 Embeddings...")
+    v2_embeddings = evaluator.get_embeddings(case2_items, batch_size=128)
+    
+    # ------------------------------------------
+    # 4. 가설 검증 결과 출력
+    # ------------------------------------------
+    # 가설 1: 앵커 정렬도
+    evaluator.test_anchor_alignment(v1_embeddings, v2_embeddings)
+    
+    # 가설 2: 군집 내/간 분산
+    evaluator.test_cluster_variance(test_items, v1_embeddings, v2_embeddings, cluster_key="product_type_name")
+    
+    # 가설 3: 필드별 기여도 (Ablation)
+    evaluator.test_ablation_variance(test_items, v2_embeddings)
+    
+    print("\n🎉 All evaluations completed successfully!")
+
+if __name__ == "__main__":
+    # 1. 모델 아키텍처 초기화 (기존 코드 활용)
+    encoder = HybridItemTower(
+        std_vocab_size=vocab.get_std_vocab_size(), 
+        num_std_fields=len(vocab.get_std_field_keys()),
+        embed_dim=128, 
+        output_dim=128
+    ).to(DEVICE)
+
+    # 2. 저장해둔 가중치 파일 경로 지정
+    CHECKPOINT_FILE = os.path.join(MODEL_DIR, "encoder_ep03_loss0.8129.pth") # 실제 파일명으로 변경
+    with SessionLocal() as db_session:
+        # 3. 평가 전용 함수 실행!
+        evaluate_trained_model(
+            encoder=encoder,
+            db_session=db_session, # 생성된 실제 세션 객체 주입
+            checkpoint_path=CHECKPOINT_FILE
+        )
