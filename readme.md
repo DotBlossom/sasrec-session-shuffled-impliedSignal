@@ -5,6 +5,8 @@
 
 본 프로젝트는 대규모 이커머스 패션 데이터(H&M, 70k+ Items, 15M+ Interactions)를 기반으로 구축된 **개인화 시퀀스 추천 파이프라인(Two-stage)**입니다. 
 
+Retrieval 모델 중, item tower , SEQ 모델만 현재 구현 중에 있습니다.
+
 LLM을 통해 추출된 비정형 텍스트 속성(9가지 의미론적 필드)을 S-BERT로 벡터화하고, 이를 아이템의 협업 필터링(CF) 시그널과 결합하기 위해 **Decoupled 3-Way User Tower** 아키텍처를 직접 설계 및 구현했습니다.
 
 ## 📌 Project Overview
