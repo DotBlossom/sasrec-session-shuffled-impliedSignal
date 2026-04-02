@@ -21,7 +21,7 @@ class PipelineConfig:
     max_len: int = 50
     dropout: float = 0.3
     pretrained_dim: int = 128 # 사전학습 아이템 벡터 차원 
-    nhead: int = 2
+    nhead: int = 8
     num_layers: int = 2
     
     # Loss Penalties

@@ -637,8 +637,81 @@ class SASRecDataset_v3_obsolete(Dataset):
 
             'interaction_dates': torch.tensor(dates_padded, dtype=torch.long),
         }
-         
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class StreamFusionGate(nn.Module):
+    def __init__(self, d_model, reduction=4):
+        super().__init__()
+        self.d_model = d_model
+        
+        # 💡 [구조 동일] 3개의 스트림을 엮어서 각 차원별 스위치(Gate)를 생성하는 SE 네트워크
+        self.se = nn.Sequential(
+            nn.Linear(d_model * 3, d_model // reduction),
+            nn.LayerNorm(d_model // reduction),
+            nn.ReLU(),
+            nn.Linear(d_model // reduction, d_model * 3) 
+        )
+        self.register_buffer('_last_ratios', torch.zeros(3))
+        
+    def set_prior_bias(self, target_open_ratios=(0.90, 0.50, 0.30)):
+        """
+        💡 [수학 수정] Softmax(경쟁)가 아닌 Sigmoid(독립 개폐)에 맞춘 Logit 역산
+        각 모달리티가 훈련 초기에 '얼마나 열려있을지' 독립적인 %를 지정합니다.
+        """
+        final_linear = self.se[3]
+        d = self.d_model
+        
+        with torch.no_grad():
+            # Weight는 0으로 묶어 초기화 간섭 방지
+            nn.init.constant_(final_linear.weight, 0.0)
+            
+            # 💡 Sigmoid 역함수: logit = ln(p / (1-p))
+            # 1. ID: 바닐라 모델처럼 처음엔 거의 다 열어줌 (90% Open) -> ln(0.9/0.1) ≈ 2.197
+            id_logit = math.log(target_open_ratios[0] / (1.0 - target_open_ratios[0]))
+            
+            # 2. Prompt: 절반 정도 열어두고 유용한 차원만 알아서 열도록 유도 (50% Open) -> ln(0.5/0.5) = 0.0
+            pr_logit = math.log(target_open_ratios[1] / (1.0 - target_open_ratios[1]))
+            
+            # 3. Static: 노이즈가 될 수 있으므로 일단 닫아두고 필요한 것만 열게 함 (10% Open) -> ln(0.1/0.9) ≈ -2.197
+            st_logit = math.log(target_open_ratios[2] / (1.0 - target_open_ratios[2]))
+            
+            final_linear.bias[0 : d] = id_logit
+            final_linear.bias[d : 2*d] = pr_logit
+            final_linear.bias[2*d : 3*d] = st_logit
+            
+            print(f"⚖️ [Fusion Gate] Element-wise Sigmoid Biases (ID: {id_logit:.2f}, Prompt: {pr_logit:.2f}, Static: {st_logit:.2f})")
+
+    def forward(self, h1, h2, h3):
+        B, S, D = h1.size()
+        
+        # 1. 3개 스트림 결합 (B, S, D*3)
+        combined = torch.cat([h1, h2, h3], dim=-1)
+        
+        # 2. SE 네트워크 통과 (각 차원별 Gate Logits 생성)
+        gate_logits = self.se(combined)
+        
+        # 3. 차원 재배열 (B, S, 3, D)
+        gate_logits = gate_logits.view(B, S, 3, D)
+        
+        # 4. 💡 [핵심] Softmax 파이 나누기 폐기 -> Sigmoid를 통한 Element-wise 독립 제어
+        # gate_weights는 이제 (B, S, 3, 128) 형태이며, 모든 값이 0~1 사이에서 독립적으로 놉니다.
+        gate_weights = torch.sigmoid(gate_logits)
+        
+        if self.training:
+            # 로깅용: 각 모달리티가 평균적으로 얼마나 열려있는지(0~1) 추적
+            self._last_ratios = gate_weights.detach().mean(dim=(0, 1, 3))
+            
+        # 5. 💡 [핵심] Element-wise Multiplication (⊙) 및 합산 (Additive Fusion)
+        # 이제 ID와 Prompt는 파이를 두고 싸우지 않으며, 각자의 128차원 스위치를 곱해 더해집니다.
+        res = (gate_weights[:, :, 0, :] * h1 + 
+               gate_weights[:, :, 1, :] * h2 + 
+               gate_weights[:, :, 2, :] * h3)
+               
+        return res      
+class StreamFusionGate_p1(nn.Module):
     def __init__(self, d_model, reduction=4):
         super().__init__()
         self.d_model = d_model
@@ -667,8 +740,8 @@ class StreamFusionGate(nn.Module):
             # ln(0.85 / 0.05) = ln(17) ≈ 2.833
             # ln(0.10 / 0.05) = ln(2)  ≈ 0.693
             
-            final_linear.bias[0 : d] = 2.833       # ID 구간 
-            final_linear.bias[d : 2*d] = 0.693     # Prompt 구간
+            final_linear.bias[0 : d] = 1.79       # ID 구간 
+            final_linear.bias[d : 2*d] = 1.09     # Prompt 구간
             # Meta 구간은 위에서 전체 0으로 초기화했으므로 0.0 유지
             
             print("⚖️ [Fusion Gate] Initial Biases Hard-coded (ID: 85%, Prompt: 10%, Meta: 5%)")
@@ -752,14 +825,19 @@ class DecoupledTransformerLayer(nn.Module):
         self.out_proj_id = nn.Linear(d_model, d_model)
         self.out_proj_prompt = nn.Linear(d_model, d_model)
         self.attn_dropout = nn.Dropout(attn_dropout)
-
+        
+        # 💡 [추가] Prompt용 Q, K (운전대 부여)
+        self.q_prompt = nn.Linear(d_model, d_model)
+        self.k_prompt = nn.Linear(d_model, d_model)
+        self.v_prompt = nn.Linear(d_model, d_model)
+        self.prompt_attn_weight = nn.Parameter(torch.tensor(0.3))
         # ----------------------------------------------------
         # 2. Feedforward Networks & LayerNorms (각각 평행하게 유지)
         # ----------------------------------------------------
         self.norm1_id = nn.LayerNorm(d_model)
         self.norm1_prompt = nn.LayerNorm(d_model)
         self.dropout1_id = nn.Dropout(dropout)
-        self.dropout1_prompt = nn.Dropout(dropout)
+        self.dropout1_prompt = nn.Dropout(0.05)
 
         self.ffn_id = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
@@ -777,7 +855,7 @@ class DecoupledTransformerLayer(nn.Module):
         self.norm2_id = nn.LayerNorm(d_model)
         self.norm2_prompt = nn.LayerNorm(d_model)
         self.dropout2_id = nn.Dropout(dropout)
-        self.dropout2_prompt = nn.Dropout(dropout)
+        self.dropout2_prompt = nn.Dropout(0.05)
         
         self._last_gate_mean = 0.0
 
@@ -800,10 +878,16 @@ class DecoupledTransformerLayer(nn.Module):
         Q_id = shape(self.q_id(normed_id))
         K_id = shape(self.k_id(normed_id))
         V_id = shape(self.v_id(normed_id))
-        V_p  = shape(self.v_prompt(normed_prompt)) 
+        
+        Q_p  = shape(self.q_prompt(normed_prompt)) # 추가
+        K_p  = shape(self.k_prompt(normed_prompt)) # 추가
+        V_p  = shape(self.v_prompt(normed_prompt))
 
-        # 2. 비침습적 어텐션 스코어 (ID 100% 주도)
-        attn_scores = torch.matmul(Q_id, K_id.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # 2. 어텐션 스코어 
+        attn_id = torch.matmul(Q_id, K_id.transpose(-2, -1))
+        attn_p  = torch.matmul(Q_p, K_p.transpose(-2, -1))
+        alpha = torch.clamp(self.prompt_attn_weight, min=0.0, max=1.0)
+        attn_scores = (attn_id + alpha * attn_p) / math.sqrt(self.head_dim)
 
         # 3. Masking & Softmax (-1e4 클램핑 삭제됨)
         if src_mask is not None:
@@ -889,6 +973,8 @@ class SASRecUserTower_v4(nn.Module):
             nn.Linear(self.d_model, self.d_model),
             nn.LayerNorm(self.d_model)
         )
+        
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
    # ── [2] Static Stream ────────────────────────────────────
         mid_dim, low_dim = 16, 4
 
@@ -952,7 +1038,7 @@ class SASRecUserTower_v4(nn.Module):
             nn.init.xavier_normal_(proj.weight)
             nn.init.constant_(proj.bias, 0)
 
-        self.fusion_gate.set_prior_bias(target_ratios=(0.85, 0.10, 0.05))
+        self.fusion_gate.set_prior_bias()
         
     def _init_weights(self, module):
         # 1. Linear 레이어: Kaiming Normal (GELU와 찰떡궁합)
@@ -1042,6 +1128,14 @@ class SASRecUserTower_v4(nn.Module):
         
         # 2. ID Stream 
         comp_item_id = self.ln_id(self.item_id_emb(item_ids))
+        if training_mode and self.training:
+            # torch.rand는 0.0 ~ 1.0 사이의 난수 생성. 
+            # 0.20보다 크면 True(1.0, 살림), 작으면 False(0.0, 죽임)
+            # 차원을 (B, S, 1)로 맞추어 128차원(D) 전체가 한 번에 0으로 꺼지게 만듦
+            id_keep_mask = (torch.rand((batch_size, seq_len, 1), device=device) > 0.20).float()
+            
+            comp_item_id = comp_item_id * id_keep_mask
+            
         item_price   = cont_feats[:, :, 0:1]
         comp_price   = self.ln_price(self.price_item_proj(item_price))
         
@@ -1137,7 +1231,7 @@ class SASRecUserTower_v4(nn.Module):
                 # target_week_vec도 마지막 시점만 추출
                 final_vec = final_vec + target_week_vec[:, -1, :]
                 final_vec = F.normalize(final_vec, p=2, dim=-1)
-                
+
             return (final_vec, streams) if return_streams else final_vec
 def inbatch_corrected_logq_loss_unified(
     user_emb, seq_item_emb, target_ids, user_ids, log_q_tensor,
@@ -1197,6 +1291,25 @@ def inbatch_corrected_logq_loss_unified(
         hn_emb_final = F.normalize(hn_emb_flat, p=2, dim=1).view(N, num_hn_to_use, -1)
 
         hn_sim = torch.bmm(user_emb.unsqueeze(1), hn_emb_final.transpose(1, 2)).squeeze(1) # [N, 20]
+        # 🛡️ [추가 장착] HNM Semantic Shield 가동!
+        if sbert_embs is not None:
+            with torch.no_grad():
+                # [N, 1, 384] 타겟 아이템 벡터
+                target_sbert = sbert_embs[target_ids].unsqueeze(1) 
+                # [N, 20, 384] HNM 아이템 벡터들
+                hn_sbert = sbert_embs[batch_hn_ids_final] 
+                
+                # 정답과 HNM 간의 텍스트 유사도 계산 [N, 20]
+                hn_sem_sim = torch.bmm(hn_sbert, target_sbert.transpose(1, 2)).squeeze(-1)
+                
+                # 임계값(0.88) 이상인 "너무 똑같은 가짜 오답"은 마스킹
+                hn_semantic_twin_mask = hn_sem_sim >= semantic_threshold
+                
+                # 가짜 오답의 코사인 유사도를 -inf로 날려버림
+                hn_sim = hn_sim.masked_fill(hn_semantic_twin_mask, SAFE_NEG_INF)
+                
+                # (옵션) HNM 쉴드로 걸러진 개수 통계
+                pure_hn_masked_cnt = hn_semantic_twin_mask.sum().item()
     else:
         hn_sim = torch.empty((N, 0), device=device)
 
@@ -2295,23 +2408,23 @@ def log_feature_contributions_v4(model, wandb, epoch=None):
             log_dict['Static/final_proj_norm'] = model.static_final_proj[0].weight.norm().item()
 
         # ════════════════════════════════════════════════════════
-        # 3. 3-Way Softmax Fusion Gate 분석 (★가장 중요)
-        #    ID_Seq vs Prompt_Seq vs Static 중 누가 정답을 맞히는 데 기여하는가?
+        # 3. 3-Way Sigmoid Fusion Gate 분석 (★Softmax에서 변경됨)
+        #    ID_Seq, Prompt_Seq, Static이 각각 128차원의 문을 
+        #    평균적으로 얼마나 열고 있는지(Open Rate, 0.0 ~ 1.0) 독립 추적
         # ════════════════════════════════════════════════════════
         if hasattr(model, 'fusion_gate') and hasattr(model.fusion_gate, '_last_ratios'):
-            # 실제 모델이 적용하고 있는 진짜 Softmax 평균 비율
-            ratios = model.fusion_gate._last_ratios
+            # 이제 비율(Ratio)이 아니라 개방률(Open Rate)입니다.
+            open_rates = model.fusion_gate._last_ratios
             
             # (옵션) 가중치 에너지가 궁금하다면 이것만 남깁니다
             fusion_linear = model.fusion_gate.se[0]
             col_norms = fusion_linear.weight.norm(dim=0)
             log_dict['Fusion_3Way_WeightNorm/ID_Seq'] = col_norms[0 : d_model].mean().item()
             
-            # 🔥 [실제 비율 로깅] 
-            log_dict['Fusion_3Way_Ratio/ID_Sequence'] = ratios[0].item()
-            log_dict['Fusion_3Way_Ratio/Prompt_Style'] = ratios[1].item()
-            log_dict['Fusion_3Way_Ratio/User_Profile'] = ratios[2].item()
-
+            # 🔥 [로깅 키 이름 변경: Ratio -> OpenRate] 
+            log_dict['Fusion_Gate_OpenRate/ID_Sequence'] = open_rates[0].item()
+            log_dict['Fusion_Gate_OpenRate/Prompt_Style']  = open_rates[1].item()
+            log_dict['Fusion_Gate_OpenRate/User_Profile']  = open_rates[2].item()
         # ════════════════════════════════════════════════════════
         # 4. 각 스트림 Projection 레이어 체급 비교
         # ════════════════════════════════════════════════════════
@@ -2327,13 +2440,26 @@ def log_feature_contributions_v4(model, wandb, epoch=None):
         # ════════════════════════════════════════════════════════
         # 5. 기타 보조 지표
         # ════════════════════════════════════════════════════════
+
         if hasattr(model, 'target_week_gate'):
             log_dict['Gate/target_week_weight'] = torch.sigmoid(model.target_week_gate).item()
             
         # 트랜스포머 레이어별 밸런스 모니터링 (ID vs Prompt)
+        alpha_list = []
         for i, layer in enumerate(model.decoupled_layers):
             log_dict[f'Layer_{i}_Norm/ID_FFN'] = layer.ffn_id[0].weight.norm().item()
             log_dict[f'Layer_{i}_Norm/Prompt_FFN'] = layer.ffn_prompt[0].weight.norm().item()
+            
+            # 💡 [신규 로깅] Learnable Alpha (Prompt Attention Weight) 추적
+            if hasattr(layer, 'prompt_attn_weight'):
+                # 실제 forward에서 적용되는 Clamp(0~1) 스케일을 그대로 계산해서 로깅
+                effective_alpha = torch.clamp(layer.prompt_attn_weight, min=0.0, max=1.0).item()
+                log_dict[f'Attention_Alpha/Layer_{i}_Prompt_Weight'] = effective_alpha
+                alpha_list.append(effective_alpha)
+        
+        # 💡 전체 레이어의 평균 Alpha 값 (대시보드에서 한눈에 트렌드를 보기 위함)
+        if alpha_list:
+            log_dict['Attention_Alpha/Mean_Prompt_Weight'] = sum(alpha_list) / len(alpha_list)
 
     wandb.log(log_dict)
 def shuffle_within_session_gpu(session_ids, padding_mask):
@@ -2429,7 +2555,7 @@ def get_top_k_params(curr_epoch: int) -> int:
         ex_top_k = 35 
     
     else: 
-        ex_top_k = 25
+        ex_top_k = 30
         
         
     return ex_top_k
@@ -2688,7 +2814,7 @@ def train_user_tower_session_sampler_with_intent_point(
             batch_hard_neg_ids = None
             ex_top_k= get_top_k_params(epoch)
             # 💡 [핵심] 에포크 4부터 실시간 Semantic-Denoised HNM 가동!
-            if epoch >=6: # 테스트 후 4~5로 조정 권장
+            if epoch >=8: # 테스트 후 4~5로 조정 권장
                 with torch.no_grad():
                     # 회원님의 'User-Anchored' 철학을 100% 유지하면서 5만 개 전역 탐색
                     batch_hard_neg_ids,shield_metrics= mine_global_hard_negatives_optimized(
@@ -2713,8 +2839,9 @@ def train_user_tower_session_sampler_with_intent_point(
                 item_embedding_weight=item_tower.item_matrix.weight,
                 step_weights=flat_weights,
                 temperature=0.07, 
+                margin = 0.0,
                 sbert_embs=sbert_embs_raw, # 👈 전체 S-BERT 임베딩 (384차원)
-                semantic_threshold=0.97,       # 👈 중앙값(0.92)을 고려한 안전한 컷오프
+                semantic_threshold=0.95,       # 👈 중앙값(0.92)을 고려한 안전한 컷오프
                 return_metrics=True
             )
             
@@ -2794,7 +2921,7 @@ def train_pipeline_from_scratch():
     # -----------------------------------------------------------
     # 💡 하이퍼파라미터 세팅
     # -----------------------------------------------------------
-    cfg.lr = 8e-4
+    cfg.lr = 3e-4
     cfg.epochs = 40           # 처음부터 학습하므로 넉넉하게 40에포크 설정
     cfg.HN_K = 150             # HNM 발동 시 추출할 풀 사이즈
     cfg.EX_TOP_K = 0
@@ -2803,7 +2930,7 @@ def train_pipeline_from_scratch():
     cfg.batch_size = 512
     cfg.dropout = 0.2
     cfg.lambda_align = 0.05
-    FREEZE_ITEM_EPOCHS = 3
+    FREEZE_ITEM_EPOCHS = 1
     HASH_SIZE = 1000
     cfg.num_prod_types = HASH_SIZE
     cfg.num_colors = HASH_SIZE
@@ -2820,7 +2947,7 @@ def train_pipeline_from_scratch():
     val_processor.i_side_arr = processor.i_side_arr
     
     aligned_sbert_embs =get_or_build_aligned_sbert_embeddings(processor, cfg.base_dir,device)
-    semantic_shield_idx = build_semantic_shield_index(aligned_sbert_embs, fn_threshold=0.97)
+    semantic_shield_idx = build_semantic_shield_index(aligned_sbert_embs, fn_threshold=0.95)
     train_loader = create_dataloaders(processor, cfg, "2020-09-16", aligned_vecs, is_train=True)
     val_loader = create_dataloaders(val_processor, cfg, "2020-09-22", aligned_vecs, is_train=False)
     
@@ -2918,7 +3045,7 @@ def train_pipeline_from_scratch():
         
 
         T_sample = 0.5
-        HNM_START_EPOCH = 6
+        HNM_START_EPOCH = 8
         if epoch >= HNM_START_EPOCH:
             hnm_rel = epoch - HNM_START_EPOCH + 1  # 1-indexed (1, 2, 3...)
             hnm_params = get_hnm_params(hnm_rel)
