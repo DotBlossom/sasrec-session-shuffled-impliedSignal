@@ -89,6 +89,7 @@
 ---
 <br>
 ---
+
 ## 📊 Item Representation Evaluation Report
 
 주제: 의미론적 필드(Semantic Field) 기반 텍스트 메타데이터 융합 전략의 유효성 검증
