@@ -1,21 +1,98 @@
 
+#  상품 추천 모델 개요 
+> **LLM 기반 데이터 구조화 및 고도화된 SASRec을 활용한 2단계 추천 시스템 연구**
+
+본 프로젝트는 SK 쉴더스 루키즈 최종 프로젝트에서 설계한 **AI 모델과 데이터 파이프라인의 범용성 및 성능을 검증**하기 위한 연구 프로젝트입니다. 대규모 패션 데이터셋(H&M)의 비정형 데이터를 LLM으로 구조화하고, 이를 2단계 개인화 추천 모델(Retrieval & Reranking)에 최적화하여 구현하였습니다.
+
+아래에서 설명하는 모델은 초기 바닐라 모델(단순 seq rec)이며, 모델의 거시적인 구조 및 데이터 구조의 추론 효용성을 증명하기위해, seq 모델 내부나 item tower 모델의 내부는 핵심 로직만 차용한 채, 가장 간략한 모델구조로 구현되었습니다.
 ---
 
-# 🚀 LLM-Enhanced Semantic Sequential Recommendation System
+##  프로젝트 개요 (Overview)
+* **연구 목적**: 비정형 상품 설명의 의미론적 속성 추출 및 추천 파이프라인의 도메인 범용성/성능 검증
+* **데이터셋**: H&M Personalized Fashion Recommendations (Item: 70k / Interaction: 15M)
+* **핵심 성과**: 
+    * seq 모델 베이스라인 대비 **Recall 평균 50~60% 향상**
+    * 연산 최적화를 통해 **VRAM 사용량 80% 절감** (RTX 2070 Super 8GB 기준)
+    
+---
 
-본 프로젝트는 대규모 이커머스 패션 데이터(H&M, 70k+ Items, 15M+ Interactions)를 기반으로 구축된 **개인화 시퀀스 추천 파이프라인(Two-stage)**입니다. 
+## 시스템 아키텍처 (Architecture)
 
-Retrieval 모델 중, item tower , SEQ 모델만 현재 구현 중에 있습니다.
+1. **전처리 및 Item Tower**: 상품/유저 로그 정제 및 Pre-trained 모델을 통한 상품 벡터 추출 후 VectorDB 저장
+2. **User Retrieval (1차 후보 추출)**: SASRec 기반 개인화 추천 및 비딥러닝 방식(인기 아이템/그래프 기반)을 혼합하여 300~500개 후보군 선정 (*비딥러닝 구현 예정*)
+3. **Reranking (최종 순위 도출)**: 1차 후보군에 LLM 구조화 피처를 **Cross-feature**로 적용하여 최종 추천 순위 도출 (*구현 예정*)
 
-LLM을 통해 추출된 비정형 텍스트 속성(9가지 의미론적 필드)을 S-BERT로 벡터화하고, 이를 아이템의 협업 필터링(CF) 시그널과 결합하기 위해 **Decoupled 3-Way User Tower** 아키텍처를 직접 설계 및 구현했습니다.
+---
 
-## 📌 Project Overview
-* **목적:** 범용적인 도메인 이식성을 갖춘 고성능 하이브리드 추천 모델 파이프라인 검증
-* **핵심 성과:** * 텍스트(Prompt)와 ID 시그널의 오버스무딩(Over-smoothing) 문제를 해결한 평행 어텐션 구조 도입.
-  * HNM(Hard Negative Mining) 과정에서 발생하는 공간 붕괴(Catastrophic Forgetting)를 방어하는 **Semantic Shield** 알고리즘 구현.
+##  Item Metadata Hybrid Structure
+아이템 임베딩의 정교함을 위해 데이터를 성격에 따라 **STD(Standard)**와 **RE(Reinforced)** 두 가지 레이어로 구조화하였습니다.
+
+### 1. STD (Standard Features) : 데이터의 앵커(Anchor)
+* **정의**: 속성값의 도메인이 한정적인 정형 카테고리 정보입니다.
+* **역할**: 임베딩 공간에서 아이템이 위치할 기본적인 좌표를 고정하는 앵커 역할을 수행합니다.
+* **주요 필드**: `prod_name`, `product_type_name`, `section_name` 등
+
+### 2. RE (Reinforced Features) : 데이터의 해상도(Resolution)
+* **정의**: 비정형 텍스트를 LLM을 통해 9가지 의미 단위 필드로 슬라이싱/정제한 데이터입니다.
+* **역할**: 단순 카테고리로 구분하기 어려운 유사 상품 간의 미세한 디테일을 보완하여 임베딩 해상도를 높입니다.
+* **주요 필드**: `MAT`(소재), `CAT`(세부 분류), `DET`(디자인 디테일) 등 9종
+
+> **성능 지표**: 앵커의 안정성(유사도 0.92)을 유지하면서 유사 상품 간 변별력 **105% 증가**, 카테고리 간 경계 **119% 명확화** 달성
+
+---
+
+##  핵심 기술 스펙 (Technical Specs)
+
+### 🔹 LLM 기반 데이터 구조화 및 피처 확장
+* **의미론적 속성 추출**: 비정형 텍스트를 패션 도메인 특화 9가지 필드로 구조화하여 Transformer 연산 효율 극대화
+* **피처 활용도**: 고품질 피처를 Retrieval 단계를 넘어 Reranker의 학습 데이터로 연계하여 파이프라인 전반의 사용성 확대
+
+### 🔹 SASRec 기반 시퀀스 추천 모델 고도화
+* **대조 학습(Contrastive Learning) 최적화**: 세션 마지막 벡터들을 활용한 Loss 연산 구조 도입으로 아이템 공간 학습 효율 증대
+* **다중 의도 파악**: 세션 내 랜덤 벡터 주입을 통해 유저의 복합적이고 우연한 니즈 반영
+* **단순 암기 방지(Shuffling)**: 세션 내 아이템 순서를 무작위로 섞어 본질적인 연관성 학습 유도
+* **맥락 분리 피처 주입**: 이전 세션과의 구매액 편차 등 유저의 상태 변화를 반영하는 데이터 주입
+
+---
+
+##  상세 수행 내역 (Implementation Details)
+
+### 1. 전처리 및 고해상도 Item Tower
+* **FastAPI 기반 파이프라인**: 원시 데이터를 복합 피처로 변환하는 모듈 설계 및 Airflow 연동 API 최적화
+* **데이터 융합**: LLM 파싱 필드를 기본 카테고리(Anchor) 피처와 융합하여 정교한 임베딩 공간 구축
+* **주요 코드 파일**:
+    * `item_tower.py`: 아이템 메타데이터 필드 임베딩 및 TransformerEncoder 인코딩. SimCSE 구조 차용 및 Unsupervised 대조학습 구현
+    * `tower_code/v3/FeatureProcessor_v3`: 유저-상품 시퀀스 및 피처 데이터 취합 및 캐싱
+    * `load_aligned_pretrained_embeddings`: 정렬된 사전학습 벡터 생성 및 DataLoader 인스턴스화
+
+### 2. Seq 모델 학습 최적화 및 경량화
+* **모델 튜닝**: Time-decay 가중치 및 확률적 셔플링 적용으로 지표 대폭 개선 (합산 Recall@k 60% 향상)
+* **학습 자원 절감**: 마지막 세션 예측 벡터와 랜덤 벡터(15%)만 손실 계산에 사용하여 **VRAM 80% 절감**
+* **데이터 정제**: S-BERT 유사도 통계 분석을 통해 실제 대체재가 오답(False Negative)으로 처리되는 현상 방지
+* **주요 코드 파일**:
+    * `SASRecDataset_v3`: 동일 세션 아이템 간 확률적 셔플링 및 Unsupervised 학습용 데이터 리턴 구현
+    * `SASRecUserTower_v3`: 데이터 분석 기반 성능 기여 피처 선별 및 유저 Seq 모델 구성
+    * `inbatch_corrected_logq_loss_with_hard_neg_margin`: LogQ Correction 및 시간 감쇠가 적용된 대조 학습 손실 함수
+
+---
+
+##  주요 성과 및 최종 지표 (Results)
+* **데이터 Adapting 전략 입증**: 정형(STD)과 비정형(RE) 데이터를 '의미론적 필드'로 융합하여 임베딩 성능 향상
+* **범용적 도메인 이식성 확보**: 신규 데이터를 '카테고리+비정형' 구조로 환원 적용 가능한 파이프라인의 높은 범용성 증명
+* **인프라 효율화**: 연산 최적화를 통해 로컬 환경(RTX 2070 Super 8GB)에서 대규모 데이터 학습 가능
+* **최종 지표**:
+    * Hard Negative Mining 적용 시 평균 5% 추가 성능 향상 확인
+    * 최종 Seq-only 모델 Recall@20 / Recall@100 / Recall@500 지표 확보 완료
+
+---
+*본 프로젝트는 모델의 정교화와 실무 파이프라인으로의 이식 가능성을 동시에 탐구하는 것을 목표로 합니다.*
+
 
 
 ---
+
+# 모델 세부 구조 advanced 과정
+
 
 ## 🏗️ Core Architecture & Implementation Details
 
