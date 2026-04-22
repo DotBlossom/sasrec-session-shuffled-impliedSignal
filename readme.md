@@ -93,12 +93,13 @@
 <br>
 <br>
 
+# 2차 프로젝트: 모델 세부 구조 advanced 개발 및 과정
 ---
 
 
 
 
-## 모델 세부 구조 advanced 과정:  Core Architecture & Implementation Details
+## Core Architecture & Implementation Details
 
 제공되는 추천 모델(`SASRecUserTower_v4`)은 단순히 피처를 이어 붙이는(Concat) 방식을 탈피하여, 각 모달리티의 고유한 기하학적 특성을 끝까지 보존하는 정교한 아키텍처를 채택했습니다.
 
